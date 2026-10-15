@@ -1,5 +1,5 @@
 // ============================================================================
-// RadminUltraRD.cpp — Ultra-Low Latency Remote Desktop (Host + Client)
+// RadminUltraRD.cpp — Ultra-Low Latency Remote Desktop (Host + Client + Files)
 // Компиляция (x64 Native Tools Command Prompt for VS):
 // cl.exe /O2 /Oi /EHsc /std:c++20 /DUNICODE /D_UNICODE RadminUltraRD.cpp /link /SUBSYSTEM:WINDOWS /OUT:RadminUltraRD.exe
 // ============================================================================
@@ -14,6 +14,8 @@
 #include <iphlpapi.h>
 #include <windows.h>
 #include <windowsx.h>
+#include <commdlg.h>
+#include <shlobj.h>
 #include <shellapi.h>
 #include <mmsystem.h>
 #include <commctrl.h>
@@ -40,7 +42,6 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
-#include <map>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -60,6 +61,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "ole32.lib")
@@ -67,17 +69,15 @@
 
 using Microsoft::WRL::ComPtr;
 
-// ============================================================================
-// КОНСТАНТЫ И ПРОТОКОЛЫ СЕТИ
-// ============================================================================
 static constexpr uint16_t  DISCOVERY_UDP_PORT  = 26999;
 static constexpr uint16_t  DEFAULT_STREAM_PORT = 27000;
 static constexpr uint32_t  MAGIC_DISCOVERY     = 0x52444D4E; // 'RDMN'
 static constexpr uint32_t  MAGIC_VIDEO         = 0x56494430; // 'VID0'
 static constexpr uint32_t  MAGIC_CONTROL       = 0x4354524C; // 'CTRL'
 static constexpr ULONG_PTR INJECTED_SIGNATURE  = 0x52444D4E;
-static constexpr size_t    MAX_UDP_PAYLOAD     = 1340;       // Безопасно для MTU Radmin VPN
+static constexpr size_t    MAX_UDP_PAYLOAD     = 1340;
 static constexpr size_t    MAX_CLIPBOARD_BYTES = 16 * 1024 * 1024;
+static constexpr size_t    FILE_CHUNK_SIZE     = 64 * 1024;  // 64 КБ чанки
 
 enum ControlMsgType : uint8_t {
     CTRL_AUTH_CHALLENGE   = 1,
@@ -89,7 +89,10 @@ enum ControlMsgType : uint8_t {
     CTRL_REQ_IDR          = 7,
     CTRL_PING             = 8,
     CTRL_PONG             = 9,
-    CTRL_RELEASE_ALL_KEYS = 10
+    CTRL_RELEASE_ALL_KEYS = 10,
+    CTRL_FILE_START       = 11,
+    CTRL_FILE_CHUNK       = 12,
+    CTRL_FILE_END         = 13
 };
 
 enum ClipboardDataType : uint8_t {
@@ -127,7 +130,7 @@ struct UdpVideoHeader {
     uint32_t frameId;
     uint16_t chunkIdx;
     uint16_t totalChunks;
-    uint8_t  flags;        // 0x01 = IDR Keyframe
+    uint8_t  flags;
     uint16_t width;
     uint16_t height;
     uint32_t encodeUs;
@@ -184,10 +187,27 @@ struct PingPongPayload {
     uint64_t timestampUs;
     uint32_t lastDecodeUs;
 };
+
+struct FileStartPayload {
+    uint32_t transferId;
+    uint64_t totalSize;
+    wchar_t  fileName[260];
+};
+
+struct FileChunkHeaderPayload {
+    uint32_t transferId;
+    uint64_t offset;
+    uint32_t chunkSize;
+};
+
+struct FileEndPayload {
+    uint32_t transferId;
+    uint8_t  status;
+};
 #pragma pack(pop)
 
 // ============================================================================
-// ТАЙМЕРЫ, ОТКЛЮЧЕНИЕ POWER THROTTLING, КРИПТОГРАФИЯ И СЕТЬ
+// УТИЛИТЫ ВРЕМЕНИ, КРИПТОГРАФИИ И СЕТИ
 // ============================================================================
 static inline uint64_t NowMicros() {
     static LARGE_INTEGER freq = {};
@@ -199,12 +219,9 @@ static inline uint64_t NowMicros() {
 
 static inline void MicroSpinWait(uint64_t delayUs) {
     uint64_t start = NowMicros();
-    while (NowMicros() - start < delayUs) {
-        YieldProcessor();
-    }
+    while (NowMicros() - start < delayUs) YieldProcessor();
 }
 
-// Гарантирует, что при сворачивании окна сервера Windows не снизит частоту кадров
 static void DisableBackgroundPowerThrottling() {
     PROCESS_POWER_THROTTLING_STATE state = {};
     state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
@@ -229,9 +246,7 @@ public:
         if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0) {
             if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) == 0) {
                 if (BCryptHashData(hHash, (PUCHAR)data, (ULONG)len, 0) == 0 &&
-                    BCryptFinishHash(hHash, outHash, 32, 0) == 0) {
-                    ok = true;
-                }
+                    BCryptFinishHash(hHash, outHash, 32, 0) == 0) ok = true;
                 BCryptDestroyHash(hHash);
             }
             BCryptCloseAlgorithmProvider(hAlg, 0);
@@ -240,17 +255,14 @@ public:
     }
 
     static bool ComputeHMACSHA256(const uint8_t* key, size_t keyLen,
-                                  const void* data, size_t dataLen,
-                                  uint8_t outMac[32]) {
+                                  const void* data, size_t dataLen, uint8_t outMac[32]) {
         BCRYPT_ALG_HANDLE hAlg = nullptr;
         BCRYPT_HASH_HANDLE hHash = nullptr;
         bool ok = false;
         if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG) == 0) {
             if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, (PUCHAR)key, (ULONG)keyLen, 0) == 0) {
                 if (BCryptHashData(hHash, (PUCHAR)data, (ULONG)dataLen, 0) == 0 &&
-                    BCryptFinishHash(hHash, outMac, 32, 0) == 0) {
-                    ok = true;
-                }
+                    BCryptFinishHash(hHash, outMac, 32, 0) == 0) ok = true;
                 BCryptDestroyHash(hHash);
             }
             BCryptCloseAlgorithmProvider(hAlg, 0);
@@ -269,18 +281,14 @@ public:
             memcpy(blockInput + 32, &ctr, 8);
             ComputeSHA256(blockInput, sizeof(blockInput), keystream);
             size_t chunk = std::min<size_t>(32, len - offset);
-            for (size_t i = 0; i < chunk; ++i) {
-                data[offset + i] ^= keystream[i];
-            }
+            for (size_t i = 0; i < chunk; ++i) data[offset + i] ^= keystream[i];
             offset += chunk;
         }
     }
 };
 
 static std::string DetectRadminVpnIP(std::vector<std::string>* outBroadcastAddrs = nullptr) {
-    std::string radminIp;
-    std::string fallbackLanIp = "127.0.0.1";
-
+    std::string radminIp, fallbackLanIp = "127.0.0.1";
     if (outBroadcastAddrs) {
         outBroadcastAddrs->clear();
         outBroadcastAddrs->push_back("26.255.255.255");
@@ -290,8 +298,7 @@ static std::string DetectRadminVpnIP(std::vector<std::string>* outBroadcastAddrs
 
     ULONG bufLen = 16384;
     std::vector<uint8_t> buffer(bufLen);
-    PIP_ADAPTER_ADDRESSES addresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-
+    auto addresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
     DWORD res = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
                                      nullptr, addresses, &bufLen);
     if (res == ERROR_BUFFER_OVERFLOW) {
@@ -302,29 +309,21 @@ static std::string DetectRadminVpnIP(std::vector<std::string>* outBroadcastAddrs
     }
 
     if (res == NO_ERROR) {
-        for (PIP_ADAPTER_ADDRESSES curr = addresses; curr != nullptr; curr = curr->Next) {
-            if (curr->OperStatus != IfOperStatusUp || curr->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
-                continue;
-
-            for (PIP_ADAPTER_UNICAST_ADDRESS ua = curr->FirstUnicastAddress; ua != nullptr; ua = ua->Next) {
+        for (auto curr = addresses; curr != nullptr; curr = curr->Next) {
+            if (curr->OperStatus != IfOperStatusUp || curr->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+            for (auto ua = curr->FirstUnicastAddress; ua != nullptr; ua = ua->Next) {
                 sockaddr_in* sin = reinterpret_cast<sockaddr_in*>(ua->Address.lpSockaddr);
                 if (!sin || sin->sin_family != AF_INET) continue;
-
                 char ipStr[INET_ADDRSTRLEN] = {};
                 inet_ntop(AF_INET, &sin->sin_addr, ipStr, sizeof(ipStr));
                 uint32_t hostIp = ntohl(sin->sin_addr.s_addr);
-
-                if ((hostIp >> 24) == 26) {
-                    radminIp = ipStr;
-                } else if (fallbackLanIp == "127.0.0.1") {
-                    fallbackLanIp = ipStr;
-                }
+                if ((hostIp >> 24) == 26) radminIp = ipStr;
+                else if (fallbackLanIp == "127.0.0.1") fallbackLanIp = ipStr;
 
                 if (outBroadcastAddrs && ua->OnLinkPrefixLength > 0 && ua->OnLinkPrefixLength < 32) {
                     uint32_t mask = (0xFFFFFFFFu << (32 - ua->OnLinkPrefixLength));
-                    uint32_t bcast = (hostIp & mask) | (~mask);
                     in_addr bcastAddr;
-                    bcastAddr.s_addr = htonl(bcast);
+                    bcastAddr.s_addr = htonl((hostIp & mask) | (~mask));
                     char bcastStr[INET_ADDRSTRLEN] = {};
                     inet_ntop(AF_INET, &bcastAddr, bcastStr, sizeof(bcastStr));
                     outBroadcastAddrs->push_back(bcastStr);
@@ -368,7 +367,109 @@ static void DisableUdpConnReset(SOCKET udpSock) {
 }
 
 // ============================================================================
-// ЗАХВАТ ЭКРАНА DXGI DESKTOP DUPLICATION + D3D11 GPU VIDEO PROCESSOR
+// ПРИЁМНИК ФАЙЛОВ (СОХРАНЕНИЕ НА РАБОЧИЙ СТОЛ С ПРОГРЕССОМ)
+// ============================================================================
+class FileTransferReceiver {
+public:
+    ~FileTransferReceiver() { CloseActiveFile(); }
+
+    void CloseActiveFile() {
+        if (m_hFile != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_hFile);
+            m_hFile = INVALID_HANDLE_VALUE;
+        }
+        m_activeTransferId = 0;
+    }
+
+    bool OnFileStart(const FileStartPayload& start, std::wstring& outStatus) {
+        CloseActiveFile();
+        std::wstring rawName(start.fileName, wcsnlen(start.fileName, 259));
+        size_t slashPos = rawName.find_last_of(L"\\/");
+        if (slashPos != std::wstring::npos) rawName = rawName.substr(slashPos + 1);
+        if (rawName.empty()) rawName = L"Received_File.bin";
+
+        wchar_t desktopDir[MAX_PATH] = {};
+        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, 0, desktopDir))) {
+            GetCurrentDirectoryW(MAX_PATH, desktopDir);
+        }
+
+        std::wstring finalPath = BuildUniqueFilePath(desktopDir, rawName);
+        m_hFile = CreateFileW(finalPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (m_hFile == INVALID_HANDLE_VALUE) {
+            outStatus = L"Ошибка создания файла: " + rawName;
+            return false;
+        }
+
+        m_activeTransferId = start.transferId;
+        m_totalBytes = start.totalSize;
+        m_receivedBytes = 0;
+        m_fileName = rawName;
+        outStatus = L"Приём файла: " + m_fileName + L" (0%)";
+        return true;
+    }
+
+    bool OnFileChunk(const FileChunkHeaderPayload& hdr, const uint8_t* data, std::wstring& outStatus, bool& notifyUi) {
+        notifyUi = false;
+        if (m_hFile == INVALID_HANDLE_VALUE || hdr.transferId != m_activeTransferId) return false;
+
+        DWORD written = 0;
+        if (!WriteFile(m_hFile, data, hdr.chunkSize, &written, nullptr) || written != hdr.chunkSize) {
+            CloseActiveFile();
+            outStatus = L"Ошибка записи файла: " + m_fileName;
+            notifyUi = true;
+            return false;
+        }
+
+        m_receivedBytes += written;
+        uint64_t now = NowMicros();
+        if (now - m_lastUiUs > 150000ULL || m_receivedBytes == m_totalBytes) {
+            m_lastUiUs = now;
+            int pct = (m_totalBytes > 0) ? (int)((m_receivedBytes * 100ULL) / m_totalBytes) : 100;
+            std::wstringstream ss;
+            ss << L"Приём: " << m_fileName << L" [" << pct << L"%, "
+               << std::fixed << std::setprecision(1) << (m_receivedBytes / 1048576.0)
+               << L" / " << (m_totalBytes / 1048576.0) << L" МБ]";
+            outStatus = ss.str();
+            notifyUi = true;
+        }
+        return true;
+    }
+
+    void OnFileEnd(const FileEndPayload& end, std::wstring& outStatus) {
+        if (end.transferId == m_activeTransferId && m_hFile != INVALID_HANDLE_VALUE) {
+            FlushFileBuffers(m_hFile);
+            CloseActiveFile();
+            outStatus = (end.status == 1)
+                ? (L"Файл сохранён на Рабочий стол: " + m_fileName)
+                : (L"Передача файла прервана: " + m_fileName);
+        }
+    }
+
+private:
+    static std::wstring BuildUniqueFilePath(const std::wstring& dir, const std::wstring& fileName) {
+        std::wstring base = dir + L"\\" + fileName;
+        if (GetFileAttributesW(base.c_str()) == INVALID_FILE_ATTRIBUTES) return base;
+        size_t dotPos = fileName.find_last_of(L'.');
+        std::wstring stem = (dotPos != std::wstring::npos) ? fileName.substr(0, dotPos) : fileName;
+        std::wstring ext  = (dotPos != std::wstring::npos) ? fileName.substr(dotPos) : L"";
+        for (int i = 1; i < 1000; ++i) {
+            std::wstring candidate = dir + L"\\" + stem + L" (" + std::to_wstring(i) + L")" + ext;
+            if (GetFileAttributesW(candidate.c_str()) == INVALID_FILE_ATTRIBUTES) return candidate;
+        }
+        return base;
+    }
+
+    HANDLE       m_hFile = INVALID_HANDLE_VALUE;
+    uint32_t     m_activeTransferId = 0;
+    uint64_t     m_totalBytes = 0;
+    uint64_t     m_receivedBytes = 0;
+    uint64_t     m_lastUiUs = 0;
+    std::wstring m_fileName;
+};
+
+// ============================================================================
+// ЗАХВАТ ЭКРАНА DXGI DESKTOP DUPLICATION + GPU VIDEO PROCESSOR
 // ============================================================================
 class DxgiScreenCapturer {
 public:
@@ -382,34 +483,25 @@ public:
 
         ComPtr<IDXGIAdapter1> targetAdapter;
         ComPtr<IDXGIOutput> targetOutput;
-
         for (UINT a = 0; factory->EnumAdapters1(a, &targetAdapter) != DXGI_ERROR_NOT_FOUND; ++a) {
-            if (SUCCEEDED(targetAdapter->EnumOutputs(0, &targetOutput))) {
-                break;
-            }
+            if (SUCCEEDED(targetAdapter->EnumOutputs(0, &targetOutput))) break;
             targetAdapter.Reset();
         }
         if (!targetAdapter || !targetOutput) return false;
 
-        D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
-        D3D_FEATURE_LEVEL achievedLevel;
-
+        D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+        D3D_FEATURE_LEVEL achieved;
         UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
         HRESULT hr = D3D11CreateDevice(targetAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
-                                       featureLevels, _countof(featureLevels), D3D11_SDK_VERSION,
-                                       &m_device, &achievedLevel, &m_context);
+                                       levels, _countof(levels), D3D11_SDK_VERSION, &m_device, &achieved, &m_context);
         if (FAILED(hr)) {
-            flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-            hr = D3D11CreateDevice(targetAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
-                                   featureLevels, _countof(featureLevels), D3D11_SDK_VERSION,
-                                   &m_device, &achievedLevel, &m_context);
+            hr = D3D11CreateDevice(targetAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                   levels, _countof(levels), D3D11_SDK_VERSION, &m_device, &achieved, &m_context);
             if (FAILED(hr)) return false;
         }
 
         ComPtr<ID3D10Multithread> mt;
-        if (SUCCEEDED(m_device.As(&mt))) {
-            mt->SetMultithreadProtected(TRUE);
-        }
+        if (SUCCEEDED(m_device.As(&mt))) mt->SetMultithreadProtected(TRUE);
 
         if (!InitDuplication()) return false;
         m_vpReady = InitVideoProcessor();
@@ -433,9 +525,7 @@ public:
     }
 
     bool CaptureToNv12(std::vector<uint8_t>& outNv12, uint32_t& outWidth, uint32_t& outHeight, bool forceEvenOnTimeout) {
-        if (!m_device) {
-            if (!Initialize(m_maxEncodeW, m_maxEncodeH)) return false;
-        }
+        if (!m_device && !Initialize(m_maxEncodeW, m_maxEncodeH)) return false;
         if (!m_dupl) {
             if (!InitDuplication()) return false;
             m_vpReady = InitVideoProcessor();
@@ -447,11 +537,8 @@ public:
         HRESULT hr = m_dupl->AcquireNextFrame(timeoutMs, &frameInfo, &desktopRes);
 
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            if (!m_hasCachedFrame) {
-                SeedInitialDesktopTexture();
-            } else if (!forceEvenOnTimeout) {
-                return false;
-            }
+            if (!m_hasCachedFrame) SeedInitialDesktopTexture();
+            else if (!forceEvenOnTimeout) return false;
         } else if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL) {
             m_dupl.Reset();
             return false;
@@ -467,24 +554,18 @@ public:
         }
 
         if (!m_hasCachedFrame) return false;
-
         outWidth = m_encodeWidth;
         outHeight = m_encodeHeight;
 
-        if (m_vpReady && ConvertViaGpuVideoProcessor(outNv12)) {
-            return true;
-        }
+        if (m_vpReady && ConvertViaGpuVideoProcessor(outNv12)) return true;
         return ConvertViaStagingFallback(outNv12);
     }
-
-    RECT GetDesktopRect() const { return m_desktopRect; }
 
 private:
     void SeedInitialDesktopTexture() {
         if (!m_cachedDesktopTex) return;
         HDC hScreen = GetDC(nullptr);
         HDC hMem = CreateCompatibleDC(hScreen);
-
         BITMAPINFO bmi = {};
         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bmi.bmiHeader.biWidth = (LONG)m_desktopWidth;
@@ -510,21 +591,16 @@ private:
     bool ConvertViaGpuVideoProcessor(std::vector<uint8_t>& outNv12) {
         D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inViewDesc = {};
         inViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-        inViewDesc.Texture2D.MipSlice = 0;
-
         ComPtr<ID3D11VideoProcessorInputView> inView;
         if (FAILED(m_videoDevice->CreateVideoProcessorInputView(m_cachedDesktopTex.Get(), m_videoEnum.Get(), &inViewDesc, &inView)))
             return false;
 
         D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outViewDesc = {};
         outViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-        outViewDesc.Texture2D.MipSlice = 0;
-
         ComPtr<ID3D11VideoProcessorOutputView> outView;
         if (FAILED(m_videoDevice->CreateVideoProcessorOutputView(m_nv12GpuTex.Get(), m_videoEnum.Get(), &outViewDesc, &outView)))
             return false;
 
-        // Явно задаем исходный и целевой прямоугольники для чистого аппаратного даунскейлинга
         RECT srcRect = { 0, 0, (LONG)m_desktopWidth, (LONG)m_desktopHeight };
         RECT dstRect = { 0, 0, (LONG)m_encodeWidth, (LONG)m_encodeHeight };
         m_videoContext->VideoProcessorSetStreamSourceRect(m_videoProc.Get(), 0, TRUE, &srcRect);
@@ -534,7 +610,6 @@ private:
         D3D11_VIDEO_PROCESSOR_STREAM stream = {};
         stream.Enable = TRUE;
         stream.pInputSurface = inView.Get();
-
         if (FAILED(m_videoContext->VideoProcessorBlt(m_videoProc.Get(), outView.Get(), 0, 1, &stream)))
             return false;
 
@@ -557,26 +632,22 @@ private:
             memcpy(dstY, srcY, ySize);
             memcpy(dstUV, srcUV, uvSize);
         } else {
-            for (uint32_t y = 0; y < m_encodeHeight; ++y) {
+            for (uint32_t y = 0; y < m_encodeHeight; ++y)
                 memcpy(dstY + (size_t)y * m_encodeWidth, srcY + (size_t)y * mapped.RowPitch, m_encodeWidth);
-            }
-            for (uint32_t y = 0; y < m_encodeHeight / 2; ++y) {
+            for (uint32_t y = 0; y < m_encodeHeight / 2; ++y)
                 memcpy(dstUV + (size_t)y * m_encodeWidth, srcUV + (size_t)y * mapped.RowPitch, m_encodeWidth);
-            }
         }
 
         m_context->Unmap(m_nv12StagingTex.Get(), 0);
         return true;
     }
 
-    // Билинейный fallback с усреднением 2x2 при даунскейле высокого разрешения
     bool ConvertViaStagingFallback(std::vector<uint8_t>& outNv12) {
         if (!m_bgraStagingTex) return false;
         m_context->CopyResource(m_bgraStagingTex.Get(), m_cachedDesktopTex.Get());
 
         D3D11_MAPPED_SUBRESOURCE mapped = {};
-        if (FAILED(m_context->Map(m_bgraStagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
-            return false;
+        if (FAILED(m_context->Map(m_bgraStagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
 
         size_t ySize = (size_t)m_encodeWidth * m_encodeHeight;
         outNv12.resize(ySize + ySize / 2);
@@ -589,14 +660,12 @@ private:
             uint32_t sy1 = std::min<uint32_t>(m_desktopHeight - 1, sy0 + 1);
             const uint8_t* row0 = srcBase + (size_t)sy0 * mapped.RowPitch;
             const uint8_t* row1 = srcBase + (size_t)sy1 * mapped.RowPitch;
-
             uint8_t* yOut = dstY + (size_t)y * m_encodeWidth;
             uint8_t* uvOut = dstUV + (size_t)(y / 2) * m_encodeWidth;
 
             for (uint32_t x = 0; x < m_encodeWidth; ++x) {
                 uint32_t sx0 = (x * m_desktopWidth) / m_encodeWidth;
                 uint32_t sx1 = std::min<uint32_t>(m_desktopWidth - 1, sx0 + 1);
-
                 const uint8_t* p00 = row0 + sx0 * 4;
                 const uint8_t* p01 = row0 + sx1 * 4;
                 const uint8_t* p10 = row1 + sx0 * 4;
@@ -606,18 +675,13 @@ private:
                 int g = (p00[1] + p01[1] + p10[1] + p11[1]) >> 2;
                 int r = (p00[2] + p01[2] + p10[2] + p11[2]) >> 2;
 
-                int yVal = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                yOut[x] = (uint8_t)std::clamp(yVal, 0, 255);
-
+                yOut[x] = (uint8_t)std::clamp(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16, 0, 255);
                 if ((y & 1) == 0 && (x & 1) == 0) {
-                    int uVal = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                    int vVal = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                    uvOut[x]     = (uint8_t)std::clamp(uVal, 0, 255);
-                    uvOut[x + 1] = (uint8_t)std::clamp(vVal, 0, 255);
+                    uvOut[x]     = (uint8_t)std::clamp(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128, 0, 255);
+                    uvOut[x + 1] = (uint8_t)std::clamp(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128, 0, 255);
                 }
             }
         }
-
         m_context->Unmap(m_bgraStagingTex.Get(), 0);
         return true;
     }
@@ -626,10 +690,8 @@ private:
         m_dupl.Reset();
         ComPtr<IDXGIDevice> dxgiDevice;
         if (FAILED(m_device.As(&dxgiDevice))) return false;
-
         ComPtr<IDXGIAdapter> adapter;
         if (FAILED(dxgiDevice->GetAdapter(&adapter))) return false;
-
         ComPtr<IDXGIOutput> output;
         if (FAILED(adapter->EnumOutputs(0, &output))) return false;
 
@@ -639,20 +701,14 @@ private:
         m_desktopWidth = std::max<uint32_t>(64, outDesc.DesktopCoordinates.right - outDesc.DesktopCoordinates.left);
         m_desktopHeight = std::max<uint32_t>(64, outDesc.DesktopCoordinates.bottom - outDesc.DesktopCoordinates.top);
 
-        uint32_t targetW = m_desktopWidth;
-        uint32_t targetH = m_desktopHeight;
+        uint32_t targetW = m_desktopWidth, targetH = m_desktopHeight;
         if (targetW > m_maxEncodeW || targetH > m_maxEncodeH) {
-            double scaleW = (double)m_maxEncodeW / targetW;
-            double scaleH = (double)m_maxEncodeH / targetH;
-            double scale = std::min(scaleW, scaleH);
+            double scale = std::min((double)m_maxEncodeW / targetW, (double)m_maxEncodeH / targetH);
             targetW = (uint32_t)std::round(targetW * scale);
             targetH = (uint32_t)std::round(targetH * scale);
         }
-        // Выравнивание по макроблокам H.264 (16x16) исключает искажение строк
-        m_encodeWidth = std::max<uint32_t>(64, (targetW + 7) & ~15u);
-        m_encodeHeight = std::max<uint32_t>(64, (targetH + 7) & ~15u);
-        if (m_encodeWidth > m_maxEncodeW) m_encodeWidth = m_maxEncodeW & ~15u;
-        if (m_encodeHeight > m_maxEncodeH) m_encodeHeight = m_maxEncodeH & ~15u;
+        m_encodeWidth = std::min<uint32_t>(m_maxEncodeW & ~15u, std::max<uint32_t>(64, (targetW + 7) & ~15u));
+        m_encodeHeight = std::min<uint32_t>(m_maxEncodeH & ~15u, std::max<uint32_t>(64, (targetH + 7) & ~15u));
 
         ComPtr<IDXGIOutput1> output1;
         if (FAILED(output.As(&output1))) return false;
@@ -667,11 +723,9 @@ private:
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
         if (FAILED(m_device->CreateTexture2D(&desc, nullptr, &m_cachedDesktopTex))) {
             desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-            if (FAILED(m_device->CreateTexture2D(&desc, nullptr, &m_cachedDesktopTex)))
-                return false;
+            if (FAILED(m_device->CreateTexture2D(&desc, nullptr, &m_cachedDesktopTex))) return false;
         }
 
         D3D11_TEXTURE2D_DESC stgDesc = desc;
@@ -679,7 +733,6 @@ private:
         stgDesc.BindFlags = 0;
         stgDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         m_device->CreateTexture2D(&stgDesc, nullptr, &m_bgraStagingTex);
-
         return true;
     }
 
@@ -688,9 +741,7 @@ private:
         m_videoEnum.Reset();
         m_videoContext.Reset();
         m_videoDevice.Reset();
-
-        if (FAILED(m_device.As(&m_videoDevice))) return false;
-        if (FAILED(m_context.As(&m_videoContext))) return false;
+        if (FAILED(m_device.As(&m_videoDevice)) || FAILED(m_context.As(&m_videoContext))) return false;
 
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc = {};
         contentDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -702,7 +753,6 @@ private:
 
         if (FAILED(m_videoDevice->CreateVideoProcessorEnumerator(&contentDesc, &m_videoEnum))) return false;
         if (FAILED(m_videoDevice->CreateVideoProcessor(m_videoEnum.Get(), 0, &m_videoProc))) return false;
-
         m_videoContext->VideoProcessorSetStreamAutoProcessingMode(m_videoProc.Get(), 0, FALSE);
 
         D3D11_TEXTURE2D_DESC nv12Desc = {};
@@ -714,15 +764,12 @@ private:
         nv12Desc.SampleDesc.Count = 1;
         nv12Desc.Usage = D3D11_USAGE_DEFAULT;
         nv12Desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-
         if (FAILED(m_device->CreateTexture2D(&nv12Desc, nullptr, &m_nv12GpuTex))) return false;
 
         nv12Desc.Usage = D3D11_USAGE_STAGING;
         nv12Desc.BindFlags = 0;
         nv12Desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        if (FAILED(m_device->CreateTexture2D(&nv12Desc, nullptr, &m_nv12StagingTex))) return false;
-
-        return true;
+        return SUCCEEDED(m_device->CreateTexture2D(&nv12Desc, nullptr, &m_nv12StagingTex));
     }
 
     ComPtr<ID3D11Device>                    m_device;
@@ -738,18 +785,15 @@ private:
     ComPtr<ID3D11Texture2D>                 m_nv12StagingTex;
 
     RECT     m_desktopRect = {};
-    uint32_t m_desktopWidth = 1920;
-    uint32_t m_desktopHeight = 1080;
-    uint32_t m_encodeWidth = 1920;
-    uint32_t m_encodeHeight = 1080;
-    uint32_t m_maxEncodeW = 1920;
-    uint32_t m_maxEncodeH = 1080;
+    uint32_t m_desktopWidth = 1920, m_desktopHeight = 1080;
+    uint32_t m_encodeWidth = 1920,  m_encodeHeight = 1080;
+    uint32_t m_maxEncodeW = 1920,   m_maxEncodeH = 1080;
     bool     m_hasCachedFrame = false;
     bool     m_vpReady = false;
 };
 
 // ============================================================================
-// КОДИРОВЩИК H.264 MEDIA FOUNDATION (ZERO-LATENCY + SPS/PPS INJECTION)
+// КОДИРОВЩИК И ДЕКОДЕР H.264 MEDIA FOUNDATION
 // ============================================================================
 class LowLatencyH264Encoder {
 public:
@@ -761,9 +805,8 @@ public:
         m_height = height;
         m_fps = fps;
 
-        HRESULT hr = CoCreateInstance(CLSID_CMSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER,
-                                      IID_PPV_ARGS(&m_encoder));
-        if (FAILED(hr)) return false;
+        if (FAILED(CoCreateInstance(CLSID_CMSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&m_encoder))))
+            return false;
 
         if (SUCCEEDED(m_encoder.As(&m_codecApi))) {
             VARIANT var = {};
@@ -773,18 +816,14 @@ public:
 
             VariantInit(&var);
             var.vt = VT_UI4;
-            var.ulVal = 0; // Строго без B-кадров
+            var.ulVal = 0;
             m_codecApi->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &var);
-
             var.ulVal = eAVEncCommonRateControlMode_CBR;
             m_codecApi->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var);
-
-            var.ulVal = 10000000; // 10 Мбит/с — оптимальный баланс четкости и размера IDR для UDP
+            var.ulVal = 10000000;
             m_codecApi->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var);
-
             var.ulVal = 0;
             m_codecApi->SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &var);
-
             var.ulVal = fps * 3;
             m_codecApi->SetValue(&CODECAPI_AVEncMPVGOPSize, &var);
         }
@@ -815,7 +854,6 @@ public:
         MFSetAttributeRatio(inType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
         if (FAILED(m_encoder->SetInputType(0, inType.Get(), 0))) return false;
-
         UpdateSequenceHeaderCache();
 
         m_encoder->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
@@ -839,7 +877,6 @@ public:
 
         ComPtr<IMFMediaBuffer> inBuf;
         if (FAILED(MFCreateMemoryBuffer((DWORD)nv12Data.size(), &inBuf))) return false;
-
         BYTE* dst = nullptr;
         if (FAILED(inBuf->Lock(&dst, nullptr, nullptr))) return false;
         memcpy(dst, nv12Data.data(), nv12Data.size());
@@ -859,12 +896,10 @@ public:
         while (true) {
             MFT_OUTPUT_STREAM_INFO streamInfo = {};
             m_encoder->GetOutputStreamInfo(0, &streamInfo);
-
             ComPtr<IMFSample> outSample;
             ComPtr<IMFMediaBuffer> outBuf;
             if (!(streamInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
-                DWORD allocSize = streamInfo.cbSize ? streamInfo.cbSize : (m_width * m_height);
-                MFCreateMemoryBuffer(allocSize, &outBuf);
+                MFCreateMemoryBuffer(streamInfo.cbSize ? streamInfo.cbSize : (m_width * m_height), &outBuf);
                 MFCreateSample(&outSample);
                 outSample->AddBuffer(outBuf.Get());
             }
@@ -888,21 +923,17 @@ public:
             ComPtr<IMFSample> resultSample = outData.pSample;
             if (resultSample) {
                 UINT32 cleanPoint = 0;
-                if (SUCCEEDED(resultSample->GetUINT32(MFSampleExtension_CleanPoint, &cleanPoint)) && cleanPoint) {
+                if (SUCCEEDED(resultSample->GetUINT32(MFSampleExtension_CleanPoint, &cleanPoint)) && cleanPoint)
                     outIsKeyFrame = true;
-                }
 
                 ComPtr<IMFMediaBuffer> contiguousBuf;
                 if (SUCCEEDED(resultSample->ConvertToContiguousBuffer(&contiguousBuf))) {
                     BYTE* pData = nullptr;
                     DWORD cbLen = 0;
                     if (SUCCEEDED(contiguousBuf->Lock(&pData, nullptr, &cbLen))) {
-                        if (ContainsIdrOrSpsNal(pData, cbLen)) {
-                            outIsKeyFrame = true;
-                        }
-                        if (outIsKeyFrame && !m_spsPpsHeader.empty() && outBitStream.empty()) {
+                        if (ContainsIdrOrSpsNal(pData, cbLen)) outIsKeyFrame = true;
+                        if (outIsKeyFrame && !m_spsPpsHeader.empty() && outBitStream.empty())
                             outBitStream.insert(outBitStream.end(), m_spsPpsHeader.begin(), m_spsPpsHeader.end());
-                        }
                         size_t cur = outBitStream.size();
                         outBitStream.resize(cur + cbLen);
                         memcpy(outBitStream.data() + cur, pData, cbLen);
@@ -942,15 +973,10 @@ private:
     ComPtr<IMFTransform> m_encoder;
     ComPtr<ICodecAPI>    m_codecApi;
     std::vector<uint8_t> m_spsPpsHeader;
-    uint32_t             m_width = 0;
-    uint32_t             m_height = 0;
-    uint32_t             m_fps = 60;
+    uint32_t             m_width = 0, m_height = 0, m_fps = 60;
     int64_t              m_pts = 0;
 };
 
-// ============================================================================
-// ДЕКОДЕР H.264 MEDIA FOUNDATION (ТОЧНОЕ ИЗВЛЕЧЕНИЕ ПЛОСКОСТЕЙ NV12)
-// ============================================================================
 struct DecodedNv12Frame {
     std::vector<uint8_t> data;
     uint32_t displayWidth = 0;
@@ -969,14 +995,11 @@ public:
         m_alignedHeight = (height + 15) & ~15u;
         m_stride = m_alignedWidth;
 
-        HRESULT hr = CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER,
-                                      IID_PPV_ARGS(&m_decoder));
-        if (FAILED(hr)) return false;
+        if (FAILED(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&m_decoder))))
+            return false;
 
         ComPtr<IMFAttributes> attr;
-        if (SUCCEEDED(m_decoder->GetAttributes(&attr))) {
-            attr->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
-        }
+        if (SUCCEEDED(m_decoder->GetAttributes(&attr))) attr->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
         ComPtr<ICodecAPI> codecApi;
         if (SUCCEEDED(m_decoder.As(&codecApi))) {
             VARIANT var = {};
@@ -1007,7 +1030,6 @@ public:
 
         ComPtr<IMFMediaBuffer> inBuf;
         if (FAILED(MFCreateMemoryBuffer((DWORD)len, &inBuf))) return false;
-
         BYTE* dst = nullptr;
         if (FAILED(inBuf->Lock(&dst, nullptr, nullptr))) return false;
         memcpy(dst, h264Data, len);
@@ -1021,19 +1043,16 @@ public:
         inSample->SetSampleDuration(166666);
         m_pts += 166666;
 
-        HRESULT hr = m_decoder->ProcessInput(0, inSample.Get(), 0);
-        if (FAILED(hr)) return false;
+        if (FAILED(m_decoder->ProcessInput(0, inSample.Get(), 0))) return false;
 
         bool gotFrame = false;
         while (true) {
             MFT_OUTPUT_STREAM_INFO streamInfo = {};
             m_decoder->GetOutputStreamInfo(0, &streamInfo);
-
             ComPtr<IMFSample> outSample;
             ComPtr<IMFMediaBuffer> outBuf;
             if (!(streamInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
-                DWORD allocSize = streamInfo.cbSize ? streamInfo.cbSize : (m_alignedWidth * m_alignedHeight * 2);
-                MFCreateMemoryBuffer(allocSize, &outBuf);
+                MFCreateMemoryBuffer(streamInfo.cbSize ? streamInfo.cbSize : (m_alignedWidth * m_alignedHeight * 2), &outBuf);
                 MFCreateSample(&outSample);
                 outSample->AddBuffer(outBuf.Get());
             }
@@ -1041,16 +1060,14 @@ public:
             MFT_OUTPUT_DATA_BUFFER outData = {};
             outData.pSample = outSample.Get();
             DWORD status = 0;
-            hr = m_decoder->ProcessOutput(0, 1, &outData, &status);
+            HRESULT hr = m_decoder->ProcessOutput(0, 1, &outData, &status);
             if (outData.pEvents) outData.pEvents->Release();
 
             if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
                 NegotiateOutputType();
                 continue;
             }
-            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT || FAILED(hr)) {
-                break;
-            }
+            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT || FAILED(hr)) break;
 
             ComPtr<IMFSample> resultSample = outData.pSample;
             if (resultSample) {
@@ -1090,9 +1107,7 @@ private:
     bool NegotiateOutputType() {
         for (DWORD i = 0; ; ++i) {
             ComPtr<IMFMediaType> availType;
-            HRESULT hr = m_decoder->GetOutputAvailableType(0, i, &availType);
-            if (FAILED(hr)) break;
-
+            if (FAILED(m_decoder->GetOutputAvailableType(0, i, &availType))) break;
             GUID subtype = {};
             availType->GetGUID(MF_MT_SUBTYPE, &subtype);
             if (subtype == MFVideoFormat_NV12) {
@@ -1103,11 +1118,10 @@ private:
                         m_alignedHeight = h;
                     }
                     UINT32 stride = 0;
-                    if (SUCCEEDED(availType->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride)) && stride > 0) {
+                    if (SUCCEEDED(availType->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride)) && stride > 0)
                         m_stride = (uint32_t)std::abs((int32_t)stride);
-                    } else {
+                    else
                         m_stride = m_alignedWidth;
-                    }
                     return true;
                 }
             }
@@ -1116,16 +1130,13 @@ private:
     }
 
     ComPtr<IMFTransform> m_decoder;
-    uint32_t m_displayWidth = 1920;
-    uint32_t m_displayHeight = 1080;
-    uint32_t m_alignedWidth = 1920;
-    uint32_t m_alignedHeight = 1088;
-    uint32_t m_stride = 1920;
+    uint32_t m_displayWidth = 1920, m_displayHeight = 1080;
+    uint32_t m_alignedWidth = 1920, m_alignedHeight = 1088, m_stride = 1920;
     int64_t  m_pts = 0;
 };
 
 // ============================================================================
-// КЛИЕНТСКИЙ DIRECT3D 11 РЕНДЕРЕР С SUPERSAMPLED ШЕЙДЕРОМ (ДЛЯ HIGH->LOW RES)
+// КЛИЕНТСКИЙ DIRECT3D 11 РЕНДЕРЕР
 // ============================================================================
 static const char* g_hlslShaderSource = R"(
 Texture2D<float>  texY  : register(t0);
@@ -1148,24 +1159,18 @@ float3 YuvToRgb(float yVal, float2 uvVal) {
     float y = max(0.0f, (yVal - 0.062745f) * 1.164383f);
     float u = uvVal.x - 0.5f;
     float v = uvVal.y - 0.5f;
-    float r = y + 1.792741f * v;
-    float g = y - 0.213248f * u - 0.532909f * v;
-    float b = y + 2.112401f * u;
-    return saturate(float3(r, g, b));
+    return saturate(float3(y + 1.792741f * v, y - 0.213248f * u - 0.532909f * v, y + 2.112401f * u));
 }
 
 float4 PSMain(VSOut i) : SV_TARGET {
-    // 5-точечный субпиксельный антиалиасинг при выводе высокого разрешения на малый экран
     float2 dx = ddx(i.uv) * 0.25f;
     float2 dy = ddy(i.uv) * 0.25f;
-
     float y0 = texY.Sample(samp, i.uv).r;
     float y1 = texY.Sample(samp, i.uv - dx - dy).r;
     float y2 = texY.Sample(samp, i.uv + dx - dy).r;
     float y3 = texY.Sample(samp, i.uv - dx + dy).r;
     float y4 = texY.Sample(samp, i.uv + dx + dy).r;
     float yAvg = y0 * 0.4f + (y1 + y2 + y3 + y4) * 0.15f;
-
     float2 uv = texUV.Sample(samp, i.uv).rg;
     return float4(YuvToRgb(yAvg, uv), 1.0f);
 }
@@ -1185,16 +1190,12 @@ public:
 
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
         D3D_FEATURE_LEVEL achieved;
-
-        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                                       levels, _countof(levels), D3D11_SDK_VERSION,
-                                       &m_device, &achieved, &m_context);
-        if (FAILED(hr)) return false;
+        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                                     levels, _countof(levels), D3D11_SDK_VERSION,
+                                     &m_device, &achieved, &m_context))) return false;
 
         ComPtr<ID3D10Multithread> mt;
-        if (SUCCEEDED(m_device.As(&mt))) {
-            mt->SetMultithreadProtected(TRUE);
-        }
+        if (SUCCEEDED(m_device.As(&mt))) mt->SetMultithreadProtected(TRUE);
 
         ComPtr<IDXGIDevice> dxgiDev;
         m_device.As(&dxgiDev);
@@ -1220,11 +1221,7 @@ public:
                 return false;
         }
         factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-
-        if (!CreateBackBufferRTV()) return false;
-        if (!CompileShaders()) return false;
-
-        return true;
+        return CreateBackBufferRTV() && CompileShaders();
     }
 
     void Shutdown() {
@@ -1252,8 +1249,7 @@ public:
         }
 
         size_t uvOffset = (size_t)frame.stride * frame.surfaceHeight;
-        size_t neededSize = uvOffset + (size_t)frame.stride * (frame.displayHeight / 2);
-        if (frame.data.size() < neededSize) return;
+        if (frame.data.size() < uvOffset + (size_t)frame.stride * (frame.displayHeight / 2)) return;
 
         const uint8_t* yPlane = frame.data.data();
         const uint8_t* uvPlane = yPlane + uvOffset;
@@ -1272,14 +1268,12 @@ public:
 
         ID3D11RenderTargetView* rtvs[] = { m_rtv.Get() };
         m_context->OMSetRenderTargets(1, rtvs, nullptr);
-
         m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
         m_context->VSSetShader(m_vs.Get(), nullptr, 0);
         m_context->PSSetShader(m_ps.Get(), nullptr, 0);
 
         ID3D11ShaderResourceView* srvs[] = { m_srvY.Get(), m_srvUV.Get() };
         m_context->PSSetShaderResources(0, 2, srvs);
-
         ID3D11SamplerState* samplers[] = { m_sampler.Get() };
         m_context->PSSetSamplers(0, 1, samplers);
 
@@ -1287,7 +1281,6 @@ public:
 
         ID3D11ShaderResourceView* nullSrvs[] = { nullptr, nullptr };
         m_context->PSSetShaderResources(0, 2, nullSrvs);
-
         m_swapChain->Present(0, 0);
     }
 
@@ -1296,40 +1289,23 @@ public:
         if (m_streamWidth == 0 || m_streamHeight == 0) return false;
         D3D11_VIEWPORT vp = CalculateLetterboxViewport();
         if (vp.Width <= 1.0f || vp.Height <= 1.0f) return false;
-
-        float nx = ((float)clientX - vp.TopLeftX) / vp.Width;
-        float ny = ((float)clientY - vp.TopLeftY) / vp.Height;
-
-        outNormX = std::clamp(nx, 0.0f, 1.0f);
-        outNormY = std::clamp(ny, 0.0f, 1.0f);
+        outNormX = std::clamp(((float)clientX - vp.TopLeftX) / vp.Width, 0.0f, 1.0f);
+        outNormY = std::clamp(((float)clientY - vp.TopLeftY) / vp.Height, 0.0f, 1.0f);
         return true;
     }
 
 private:
     void ShutdownInternal() {
-        m_srvY.Reset();
-        m_srvUV.Reset();
-        m_texY.Reset();
-        m_texUV.Reset();
-        m_sampler.Reset();
-        m_vs.Reset();
-        m_ps.Reset();
-        m_rtv.Reset();
-        m_swapChain.Reset();
-        m_context.Reset();
-        m_device.Reset();
-        m_streamWidth = 0;
-        m_streamHeight = 0;
+        m_srvY.Reset(); m_srvUV.Reset(); m_texY.Reset(); m_texUV.Reset();
+        m_sampler.Reset(); m_vs.Reset(); m_ps.Reset(); m_rtv.Reset();
+        m_swapChain.Reset(); m_context.Reset(); m_device.Reset();
+        m_streamWidth = 0; m_streamHeight = 0;
     }
 
     D3D11_VIEWPORT CalculateLetterboxViewport() const {
-        D3D11_VIEWPORT vp = {};
-        vp.MinDepth = 0.0f;
-        vp.MaxDepth = 1.0f;
-
+        D3D11_VIEWPORT vp = { 0, 0, 0, 0, 0.0f, 1.0f };
         uint32_t sw = m_streamWidth ? m_streamWidth : 1920;
         uint32_t sh = m_streamHeight ? m_streamHeight : 1080;
-
         float winAspect = (float)m_winWidth / (float)std::max<uint32_t>(1, m_winHeight);
         float streamAspect = (float)sw / (float)std::max<uint32_t>(1, sh);
 
@@ -1337,11 +1313,9 @@ private:
             vp.Height = (float)m_winHeight;
             vp.Width = vp.Height * streamAspect;
             vp.TopLeftX = ((float)m_winWidth - vp.Width) * 0.5f;
-            vp.TopLeftY = 0.0f;
         } else {
             vp.Width = (float)m_winWidth;
             vp.Height = vp.Width / streamAspect;
-            vp.TopLeftX = 0.0f;
             vp.TopLeftY = ((float)m_winHeight - vp.Height) * 0.5f;
         }
         return vp;
@@ -1356,17 +1330,11 @@ private:
     bool CompileShaders() {
         ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
         if (FAILED(D3DCompile(g_hlslShaderSource, strlen(g_hlslShaderSource), nullptr, nullptr, nullptr,
-                              "VSMain", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errBlob)))
-            return false;
-
+                              "VSMain", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &errBlob))) return false;
         if (FAILED(D3DCompile(g_hlslShaderSource, strlen(g_hlslShaderSource), nullptr, nullptr, nullptr,
-                              "PSMain", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob)))
-            return false;
-
-        if (FAILED(m_device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &m_vs)))
-            return false;
-        if (FAILED(m_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &m_ps)))
-            return false;
+                              "PSMain", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &errBlob))) return false;
+        if (FAILED(m_device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &m_vs))) return false;
+        if (FAILED(m_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &m_ps))) return false;
 
         D3D11_SAMPLER_DESC sampDesc = {};
         sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1374,39 +1342,24 @@ private:
         sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
         sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
         sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
-
         return SUCCEEDED(m_device->CreateSamplerState(&sampDesc, &m_sampler));
     }
 
     bool CreateStreamTextures(uint32_t width, uint32_t height) {
-        m_srvY.Reset();
-        m_srvUV.Reset();
-        m_texY.Reset();
-        m_texUV.Reset();
-
+        m_srvY.Reset(); m_srvUV.Reset(); m_texY.Reset(); m_texUV.Reset();
         D3D11_TEXTURE2D_DESC descY = {};
-        descY.Width = width;
-        descY.Height = height;
-        descY.MipLevels = 1;
-        descY.ArraySize = 1;
-        descY.Format = DXGI_FORMAT_R8_UNORM;
-        descY.SampleDesc.Count = 1;
-        descY.Usage = D3D11_USAGE_DEFAULT;
-        descY.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-        if (FAILED(m_device->CreateTexture2D(&descY, nullptr, &m_texY))) return false;
-        if (FAILED(m_device->CreateShaderResourceView(m_texY.Get(), nullptr, &m_srvY))) return false;
+        descY.Width = width; descY.Height = height; descY.MipLevels = 1; descY.ArraySize = 1;
+        descY.Format = DXGI_FORMAT_R8_UNORM; descY.SampleDesc.Count = 1;
+        descY.Usage = D3D11_USAGE_DEFAULT; descY.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(m_device->CreateTexture2D(&descY, nullptr, &m_texY)) ||
+            FAILED(m_device->CreateShaderResourceView(m_texY.Get(), nullptr, &m_srvY))) return false;
 
         D3D11_TEXTURE2D_DESC descUV = descY;
-        descUV.Width = width / 2;
-        descUV.Height = height / 2;
-        descUV.Format = DXGI_FORMAT_R8G8_UNORM;
+        descUV.Width = width / 2; descUV.Height = height / 2; descUV.Format = DXGI_FORMAT_R8G8_UNORM;
+        if (FAILED(m_device->CreateTexture2D(&descUV, nullptr, &m_texUV)) ||
+            FAILED(m_device->CreateShaderResourceView(m_texUV.Get(), nullptr, &m_srvUV))) return false;
 
-        if (FAILED(m_device->CreateTexture2D(&descUV, nullptr, &m_texUV))) return false;
-        if (FAILED(m_device->CreateShaderResourceView(m_texUV.Get(), nullptr, &m_srvUV))) return false;
-
-        m_streamWidth = width;
-        m_streamHeight = height;
+        m_streamWidth = width; m_streamHeight = height;
         return true;
     }
 
@@ -1419,25 +1372,18 @@ private:
     ComPtr<ID3D11VertexShader>          m_vs;
     ComPtr<ID3D11PixelShader>           m_ps;
     ComPtr<ID3D11SamplerState>          m_sampler;
-    ComPtr<ID3D11Texture2D>             m_texY;
-    ComPtr<ID3D11Texture2D>             m_texUV;
-    ComPtr<ID3D11ShaderResourceView>    m_srvY;
-    ComPtr<ID3D11ShaderResourceView>    m_srvUV;
-
-    uint32_t m_winWidth = 1280;
-    uint32_t m_winHeight = 720;
-    uint32_t m_streamWidth = 0;
-    uint32_t m_streamHeight = 0;
+    ComPtr<ID3D11Texture2D>             m_texY, m_texUV;
+    ComPtr<ID3D11ShaderResourceView>    m_srvY, m_srvUV;
+    uint32_t m_winWidth = 1280, m_winHeight = 720, m_streamWidth = 0, m_streamHeight = 0;
 };
 
 // ============================================================================
-// ИНЪЕКЦИЯ ВВОДА (С ЗАЩИТОЙ ОТ ЗАЛИПАНИЯ КЛАВИШИ WIN) И БУФЕР ОБМЕНА
+// ИНЪЕКЦИЯ ВВОДА И БУФЕР ОБМЕНА
 // ============================================================================
 class InputAndClipboardManager {
 public:
     void InjectMouseEvent(const MouseEventPayload& ev, const RECT& desktopRect, bool isLocalLoopback) {
         if (isLocalLoopback) return;
-
         INPUT inp = {};
         inp.type = INPUT_MOUSE;
         inp.mi.dwExtraInfo = INJECTED_SIGNATURE;
@@ -1452,7 +1398,6 @@ public:
                 int deskH = std::max<int>(1, desktopRect.bottom - desktopRect.top);
                 int targetX = desktopRect.left + (int)(ev.normX * (deskW - 1));
                 int targetY = desktopRect.top  + (int)(ev.normY * (deskH - 1));
-
                 int virtW = std::max<int>(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
                 int virtH = std::max<int>(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
                 int virtX = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -1470,22 +1415,14 @@ public:
         if (ev.flags & MBTN_RIGHT_UP)   inp.mi.dwFlags |= MOUSEEVENTF_RIGHTUP;
         if (ev.flags & MBTN_MID_DOWN)   inp.mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN;
         if (ev.flags & MBTN_MID_UP)     inp.mi.dwFlags |= MOUSEEVENTF_MIDDLEUP;
-
-        if (ev.flags & MBTN_WHEEL_V) {
-            inp.mi.dwFlags |= MOUSEEVENTF_WHEEL;
-            inp.mi.mouseData = (DWORD)ev.wheelDelta;
-        }
-        if (ev.flags & MBTN_WHEEL_H) {
-            inp.mi.dwFlags |= MOUSEEVENTF_HWHEEL;
-            inp.mi.mouseData = (DWORD)ev.wheelDelta;
-        }
+        if (ev.flags & MBTN_WHEEL_V)    { inp.mi.dwFlags |= MOUSEEVENTF_WHEEL;  inp.mi.mouseData = (DWORD)ev.wheelDelta; }
+        if (ev.flags & MBTN_WHEEL_H)    { inp.mi.dwFlags |= MOUSEEVENTF_HWHEEL; inp.mi.mouseData = (DWORD)ev.wheelDelta; }
 
         SendInput(1, &inp, sizeof(INPUT));
     }
 
     void InjectKeyEvent(const KeyEventPayload& ev, bool isLocalLoopback) {
         if (isLocalLoopback) return;
-
         {
             std::lock_guard<std::mutex> lock(m_keyStateMutex);
             if (ev.vKey < 256) {
@@ -1501,40 +1438,29 @@ public:
         inp.ki.wScan = ev.scanCode;
         inp.ki.dwExtraInfo = INJECTED_SIGNATURE;
 
-        // Для клавиш Windows (VK_LWIN / VK_RWIN) обязательно используем виртуальный код + EXTENDEDKEY
         if (ev.vKey == VK_LWIN || ev.vKey == VK_RWIN) {
             inp.ki.dwFlags = KEYEVENTF_EXTENDEDKEY | (ev.isDown ? 0 : KEYEVENTF_KEYUP);
         } else {
-            if (ev.scanCode != 0) {
-                inp.ki.dwFlags = KEYEVENTF_SCANCODE;
-            }
-            if (ev.isExtended) {
-                inp.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-            }
-            if (!ev.isDown) {
-                inp.ki.dwFlags |= KEYEVENTF_KEYUP;
-            }
+            if (ev.scanCode != 0) inp.ki.dwFlags = KEYEVENTF_SCANCODE;
+            if (ev.isExtended)    inp.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+            if (!ev.isDown)       inp.ki.dwFlags |= KEYEVENTF_KEYUP;
         }
-
         SendInput(1, &inp, sizeof(INPUT));
     }
 
-    // Принудительный сброс всех зажатых клавиш и модификаторов (Win, Alt, Ctrl, Shift)
     void ReleaseAllHeldKeys() {
         std::lock_guard<std::mutex> lock(m_keyStateMutex);
         std::vector<INPUT> inputs;
-
         auto AddVkRelease = [&](WORD vk, WORD scan, bool ext) {
             INPUT inp = {};
             inp.type = INPUT_KEYBOARD;
             inp.ki.wVk = vk;
             inp.ki.wScan = scan;
             inp.ki.dwExtraInfo = INJECTED_SIGNATURE;
-            if (vk == VK_LWIN || vk == VK_RWIN || scan == 0) {
+            if (vk == VK_LWIN || vk == VK_RWIN || scan == 0)
                 inp.ki.dwFlags = KEYEVENTF_KEYUP | (ext ? KEYEVENTF_EXTENDEDKEY : 0);
-            } else {
+            else
                 inp.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP | (ext ? KEYEVENTF_EXTENDEDKEY : 0);
-            }
             inputs.push_back(inp);
         };
 
@@ -1544,8 +1470,6 @@ public:
                 m_heldVKeys[vk] = false;
             }
         }
-
-        // Гарантированно отпускаем системные клавиши Windows и модификаторы
         AddVkRelease(VK_LWIN, 0x5B, true);
         AddVkRelease(VK_RWIN, 0x5C, true);
         AddVkRelease(VK_LSHIFT, (WORD)MapVirtualKeyW(VK_LSHIFT, MAPVK_VK_TO_VSC), false);
@@ -1555,19 +1479,13 @@ public:
         AddVkRelease(VK_LMENU, (WORD)MapVirtualKeyW(VK_LMENU, MAPVK_VK_TO_VSC), false);
         AddVkRelease(VK_RMENU, (WORD)MapVirtualKeyW(VK_RMENU, MAPVK_VK_TO_VSC), true);
 
-        if (!inputs.empty()) {
-            SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
-        }
+        if (!inputs.empty()) SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
     }
 
     bool CaptureClipboardIfChanged(HWND hwndOwner, uint8_t& outFormat, std::vector<uint8_t>& outData, uint8_t outHash[32]) {
         if (m_ignoreNextEvent.exchange(false)) return false;
-
         bool opened = false;
-        for (int i = 0; i < 5; ++i) {
-            if (OpenClipboard(hwndOwner)) { opened = true; break; }
-            Sleep(5);
-        }
+        for (int i = 0; i < 5; ++i) { if (OpenClipboard(hwndOwner)) { opened = true; break; } Sleep(5); }
         if (!opened) return false;
 
         bool captured = false;
@@ -1596,12 +1514,10 @@ public:
                 if (ptr) GlobalUnlock(hData);
             }
         }
-
         CloseClipboard();
         if (!captured) return false;
 
         CryptoEngine::ComputeSHA256(outData.data(), outData.size(), outHash);
-
         std::lock_guard<std::mutex> lock(m_hashMutex);
         if (memcmp(outHash, m_lastSyncedHash, 32) == 0) return false;
         memcpy(m_lastSyncedHash, outHash, 32);
@@ -1610,20 +1526,14 @@ public:
 
     void ApplyRemoteClipboard(HWND hwndOwner, uint8_t format, const std::vector<uint8_t>& data, const uint8_t hash[32]) {
         if (data.empty() || data.size() > MAX_CLIPBOARD_BYTES) return;
-
         {
             std::lock_guard<std::mutex> lock(m_hashMutex);
             if (memcmp(hash, m_lastSyncedHash, 32) == 0) return;
             memcpy(m_lastSyncedHash, hash, 32);
         }
-
         m_ignoreNextEvent = true;
-
         bool opened = false;
-        for (int i = 0; i < 5; ++i) {
-            if (OpenClipboard(hwndOwner)) { opened = true; break; }
-            Sleep(5);
-        }
+        for (int i = 0; i < 5; ++i) { if (OpenClipboard(hwndOwner)) { opened = true; break; } Sleep(5); }
         if (!opened) return;
 
         EmptyClipboard();
@@ -1633,11 +1543,9 @@ public:
             if (dst) {
                 memcpy(dst, data.data(), data.size());
                 GlobalUnlock(hMem);
-                UINT winFmt = (format == CLIP_FORMAT_IMAGE_DIB) ? CF_DIB : CF_UNICODETEXT;
-                if (!SetClipboardData(winFmt, hMem)) GlobalFree(hMem);
-            } else {
-                GlobalFree(hMem);
-            }
+                if (!SetClipboardData((format == CLIP_FORMAT_IMAGE_DIB) ? CF_DIB : CF_UNICODETEXT, hMem))
+                    GlobalFree(hMem);
+            } else GlobalFree(hMem);
         }
         CloseClipboard();
     }
@@ -1647,42 +1555,43 @@ private:
     bool              m_heldVKeys[256] = {};
     uint16_t          m_heldScans[256] = {};
     bool              m_heldExt[256]   = {};
-
     std::atomic<bool> m_ignoreNextEvent{ false };
     std::mutex        m_hashMutex;
     uint8_t           m_lastSyncedHash[32] = {};
 };
 
 // ============================================================================
-// ГЛОБАЛЬНОЕ СОСТОЯНИЕ, АДАПТИВНЫЙ ИНТЕРФЕЙС И СИСТЕМНЫЙ ТРЕЙ
+// ГЛОБАЛЬНОЕ ПРИЛОЖЕНИЕ, GUI И ПЕРЕДАЧА ФАЙЛОВ
 // ============================================================================
 enum GuiControlIds : int {
-    IDC_GRP_SERVER      = 100,
-    IDC_LBL_SRV_NAME    = 101,
-    IDC_EDIT_SRV_NAME   = 102,
-    IDC_LBL_SRV_PASS    = 103,
-    IDC_EDIT_SRV_PASS   = 104,
-    IDC_LBL_SRV_PORT    = 105,
-    IDC_EDIT_SRV_PORT   = 106,
-    IDC_CHK_AUTO_MIN    = 107,
-    IDC_BTN_SRV_TOGGLE  = 108,
-    IDC_BTN_SRV_TRAY    = 109,
-    IDC_LBL_SRV_STATUS  = 110,
+    IDC_GRP_SERVER       = 100,
+    IDC_LBL_SRV_NAME     = 101,
+    IDC_EDIT_SRV_NAME    = 102,
+    IDC_LBL_SRV_PASS     = 103,
+    IDC_EDIT_SRV_PASS    = 104,
+    IDC_LBL_SRV_PORT     = 105,
+    IDC_EDIT_SRV_PORT    = 106,
+    IDC_CHK_AUTO_MIN     = 107,
+    IDC_BTN_SRV_TOGGLE   = 108,
+    IDC_BTN_SRV_TRAY     = 109,
+    IDC_BTN_SRV_SENDFILE = 110,
+    IDC_LBL_SRV_STATUS   = 111,
 
-    IDC_GRP_CLIENT      = 200,
-    IDC_BTN_CLI_SCAN    = 201,
-    IDC_LIST_HOSTS      = 202,
-    IDC_LBL_CLI_IP      = 203,
-    IDC_EDIT_CLI_IP     = 204,
-    IDC_EDIT_CLI_PORT   = 205,
-    IDC_LBL_CLI_PASS    = 206,
-    IDC_EDIT_CLI_PASS   = 207,
-    IDC_BTN_CLI_CONNECT = 208,
-    IDC_LBL_CLI_STATUS  = 209,
+    IDC_GRP_CLIENT       = 200,
+    IDC_BTN_CLI_SCAN     = 201,
+    IDC_LIST_HOSTS       = 202,
+    IDC_LBL_CLI_IP       = 203,
+    IDC_EDIT_CLI_IP      = 204,
+    IDC_EDIT_CLI_PORT    = 205,
+    IDC_LBL_CLI_PASS     = 206,
+    IDC_EDIT_CLI_PASS    = 207,
+    IDC_BTN_CLI_CONNECT  = 208,
+    IDC_BTN_CLI_SENDFILE = 209,
+    IDC_LBL_CLI_STATUS   = 210,
 
-    IDM_TRAY_RESTORE    = 301,
-    IDM_TRAY_STOP_SRV   = 302,
-    IDM_TRAY_EXIT       = 303
+    IDM_TRAY_RESTORE     = 301,
+    IDM_TRAY_STOP_SRV    = 302,
+    IDM_TRAY_EXIT        = 303
 };
 
 static constexpr UINT WM_APP_UPDATE_UI   = WM_APP + 10;
@@ -1691,11 +1600,9 @@ static constexpr UINT WM_APP_CLIENT_LOST = WM_APP + 12;
 static constexpr UINT WM_APP_TRAY_ICON   = WM_APP + 13;
 
 struct DiscoveredHostInfo {
-    std::string name;
-    std::string ip;
+    std::string name, ip;
     uint16_t    port;
-    uint32_t    width;
-    uint32_t    height;
+    uint32_t    width, height;
 };
 
 class RemoteDesktopApp {
@@ -1708,83 +1615,219 @@ public:
     bool  m_trayAdded = false;
 
     // Контролы Сервера
-    HWND m_grpServer     = nullptr;
-    HWND m_lblSrvName    = nullptr;
-    HWND m_editSrvName   = nullptr;
-    HWND m_lblSrvPass    = nullptr;
-    HWND m_editSrvPass   = nullptr;
-    HWND m_lblSrvPort    = nullptr;
-    HWND m_editSrvPort   = nullptr;
-    HWND m_chkAutoMin    = nullptr;
-    HWND m_btnSrvToggle  = nullptr;
-    HWND m_btnSrvTray    = nullptr;
-    HWND m_lblSrvStatus  = nullptr;
+    HWND m_grpServer = nullptr, m_lblSrvName = nullptr, m_editSrvName = nullptr;
+    HWND m_lblSrvPass = nullptr, m_editSrvPass = nullptr, m_lblSrvPort = nullptr, m_editSrvPort = nullptr;
+    HWND m_chkAutoMin = nullptr, m_btnSrvToggle = nullptr, m_btnSrvTray = nullptr;
+    HWND m_btnSrvSendFile = nullptr, m_lblSrvStatus = nullptr;
 
     // Контролы Клиента
-    HWND m_grpClient     = nullptr;
-    HWND m_btnCliScan    = nullptr;
-    HWND m_listHosts     = nullptr;
-    HWND m_lblCliIp      = nullptr;
-    HWND m_editCliIp     = nullptr;
-    HWND m_editCliPort   = nullptr;
-    HWND m_lblCliPass    = nullptr;
-    HWND m_editCliPass   = nullptr;
-    HWND m_btnCliConnect = nullptr;
-    HWND m_lblCliStatus  = nullptr;
+    HWND m_grpClient = nullptr, m_btnCliScan = nullptr, m_listHosts = nullptr;
+    HWND m_lblCliIp = nullptr, m_editCliIp = nullptr, m_editCliPort = nullptr;
+    HWND m_lblCliPass = nullptr, m_editCliPass = nullptr, m_btnCliConnect = nullptr;
+    HWND m_btnCliSendFile = nullptr, m_lblCliStatus = nullptr;
 
-    // Сервер
+    // Состояние Сервера
     std::atomic<bool>     m_serverRunning{ false };
     std::atomic<bool>     m_clientAuthorized{ false };
     std::atomic<bool>     m_forceIdrNextFrame{ true };
-    std::atomic<uint32_t> m_srvFps{ 0 };
-    std::atomic<uint32_t> m_srvEncodeUs{ 0 };
-    std::atomic<uint32_t> m_srvClientDecodeUs{ 0 };
-    std::atomic<uint32_t> m_srvRttUs{ 0 };
-    std::string           m_radminIp;
-    std::string           m_connectedClientIp;
+    std::atomic<uint32_t> m_srvFps{ 0 }, m_srvEncodeUs{ 0 }, m_srvClientDecodeUs{ 0 }, m_srvRttUs{ 0 };
+    std::string           m_radminIp, m_connectedClientIp;
     uint16_t              m_serverPort = DEFAULT_STREAM_PORT;
 
-    SOCKET                m_srvListenTcp = INVALID_SOCKET;
-    SOCKET                m_srvClientTcp = INVALID_SOCKET;
-    SOCKET                m_srvVideoUdp  = INVALID_SOCKET;
-    SOCKET                m_srvDiscUdp   = INVALID_SOCKET;
-    std::mutex            m_srvTcpSendMutex;
-    std::mutex            m_srvClientUdpMutex;
+    SOCKET                m_srvListenTcp = INVALID_SOCKET, m_srvClientTcp = INVALID_SOCKET;
+    SOCKET                m_srvVideoUdp  = INVALID_SOCKET, m_srvDiscUdp   = INVALID_SOCKET;
+    std::mutex            m_srvTcpSendMutex, m_srvClientUdpMutex;
     sockaddr_in           m_srvClientUdpAddr = {};
     bool                  m_hasClientUdpAddr = false;
     uint64_t              m_activeUdpToken = 0;
     uint8_t               m_srvSessionKey[32] = {};
+    std::thread           m_srvAcceptThread, m_srvDiscoveryThread, m_srvCaptureThread;
 
-    std::thread           m_srvAcceptThread;
-    std::thread           m_srvDiscoveryThread;
-    std::thread           m_srvCaptureThread;
-
-    // Клиент
+    // Состояние Клиента
     std::atomic<bool>     m_clientRunning{ false };
-    std::atomic<uint32_t> m_cliFps{ 0 };
-    std::atomic<uint32_t> m_cliEncodeUs{ 0 };
-    std::atomic<uint32_t> m_cliDecodeUs{ 0 };
-    std::atomic<uint32_t> m_cliRttUs{ 0 };
-    SOCKET                m_cliTcpSock = INVALID_SOCKET;
-    SOCKET                m_cliUdpSock = INVALID_SOCKET;
+    std::atomic<uint32_t> m_cliFps{ 0 }, m_cliEncodeUs{ 0 }, m_cliDecodeUs{ 0 }, m_cliRttUs{ 0 };
+    SOCKET                m_cliTcpSock = INVALID_SOCKET, m_cliUdpSock = INVALID_SOCKET;
     std::mutex            m_cliTcpSendMutex;
     uint8_t               m_cliSessionKey[32] = {};
-    uint64_t              m_cliUdpToken = 0;
-    uint64_t              m_lastIdrReqUs = 0;
-
-    std::thread           m_cliTcpThread;
-    std::thread           m_cliUdpThread;
+    uint64_t              m_cliUdpToken = 0, m_lastIdrReqUs = 0;
+    std::thread           m_cliTcpThread, m_cliUdpThread;
     D3D11ClientRenderer   m_renderer;
     InputAndClipboardManager m_inputAndClip;
 
+    // Состояние передачи файлов
+    std::atomic<bool>     m_srvSendingFile{ false };
+    std::atomic<bool>     m_cliSendingFile{ false };
+    std::mutex            m_fileStatusMutex;
+    std::wstring          m_srvFileStatus = L"Файлы: готово к передаче (сохранение на Рабочий стол)";
+    std::wstring          m_cliFileStatus = L"Файлы: готово к передаче (сохранение на Рабочий стол)";
+
     std::mutex                      m_hostsMutex;
     std::vector<DiscoveredHostInfo> m_discoveredHosts;
-
     bool m_isViewerFullscreen = false;
     WINDOWPLACEMENT m_viewerPrevPlacement = { sizeof(WINDOWPLACEMENT) };
 
+    void SetFileStatus(bool forServer, const std::wstring& text) {
+        {
+            std::lock_guard<std::mutex> lock(m_fileStatusMutex);
+            if (forServer) m_srvFileStatus = text;
+            else           m_cliFileStatus = text;
+        }
+        PostMessageW(m_hwndMain, WM_APP_UPDATE_UI, 0, 0);
+    }
+
+    // Диалог выбора файла и запуск асинхронной отправки
+    void PromptAndSendFile(bool fromServer) {
+        if (fromServer) {
+            if (!m_serverRunning || !m_clientAuthorized || m_srvClientTcp == INVALID_SOCKET) {
+                MessageBoxW(m_hwndMain, L"Нет подключенного клиента для отправки файла!", L"Отправка файла", MB_ICONWARNING);
+                return;
+            }
+            if (m_srvSendingFile) {
+                MessageBoxW(m_hwndMain, L"Дождитесь завершения текущей отправки файла!", L"Отправка файла", MB_ICONINFORMATION);
+                return;
+            }
+        } else {
+            if (!m_clientRunning || m_cliTcpSock == INVALID_SOCKET) {
+                MessageBoxW(m_hwndMain, L"Сначала подключитесь к удаленному ПК!", L"Отправка файла", MB_ICONWARNING);
+                return;
+            }
+            if (m_cliSendingFile) {
+                MessageBoxW(m_hwndMain, L"Дождитесь завершения текущей отправки файла!", L"Отправка файла", MB_ICONINFORMATION);
+                return;
+            }
+        }
+
+        wchar_t filePath[MAX_PATH] = {};
+        OPENFILENAMEW ofn = { sizeof(OPENFILENAMEW) };
+        ofn.hwndOwner = m_hwndMain;
+        ofn.lpstrFilter = L"Все файлы (*.*)\0*.*\0";
+        ofn.lpstrFile = filePath;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrTitle = fromServer ? L"Выберите файл для отправки клиенту" : L"Выберите файл для отправки на удаленный ПК";
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+        if (GetOpenFileNameW(&ofn)) {
+            SendFileAsync(filePath, fromServer);
+        }
+    }
+
+    void SendFileAsync(const std::wstring& filePath, bool fromServer) {
+        if (fromServer) {
+            if (m_srvSendingFile.exchange(true)) return;
+        } else {
+            if (m_cliSendingFile.exchange(true)) return;
+        }
+
+        std::thread([this, filePath, fromServer]() {
+            HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hFile == INVALID_HANDLE_VALUE) {
+                SetFileStatus(fromServer, L"Ошибка открытия файла для отправки!");
+                if (fromServer) m_srvSendingFile = false; else m_cliSendingFile = false;
+                return;
+            }
+
+            LARGE_INTEGER fileSizeLi = {};
+            GetFileSizeEx(hFile, &fileSizeLi);
+            uint64_t totalSize = (uint64_t)fileSizeLi.QuadPart;
+
+            std::wstring baseName = filePath;
+            size_t slash = baseName.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) baseName = baseName.substr(slash + 1);
+
+            uint32_t transferId = (uint32_t)(NowMicros() & 0xFFFFFFFFu);
+            if (transferId == 0) transferId = 1;
+
+            SOCKET& sockRef = fromServer ? m_srvClientTcp : m_cliTcpSock;
+            std::mutex& mtxRef = fromServer ? m_srvTcpSendMutex : m_cliTcpSendMutex;
+            const uint8_t* keyPtr = fromServer ? m_srvSessionKey : m_cliSessionKey;
+
+            // 1. Пакет начала файла (CTRL_FILE_START)
+            FileStartPayload startPkt = {};
+            startPkt.transferId = transferId;
+            startPkt.totalSize = totalSize;
+            wcsncpy_s(startPkt.fileName, baseName.c_str(), _TRUNCATE);
+
+            FileStartPayload encStart = startPkt;
+            CryptoEngine::StreamCrypt(reinterpret_cast<uint8_t*>(&encStart), sizeof(encStart), keyPtr, 4);
+
+            ControlHeader startHdr = { MAGIC_CONTROL, CTRL_FILE_START, sizeof(encStart) };
+            bool sendOk = false;
+            {
+                std::lock_guard<std::mutex> lock(mtxRef);
+                sendOk = SendAllTcp(sockRef, &startHdr, sizeof(startHdr)) &&
+                         SendAllTcp(sockRef, &encStart, sizeof(encStart));
+            }
+
+            SetFileStatus(fromServer, L"Отправка: " + baseName + L" (0%)");
+
+            // 2. Потоковая передача чанками по 64 КБ (CTRL_FILE_CHUNK)
+            std::vector<uint8_t> chunkBuf(sizeof(FileChunkHeaderPayload) + FILE_CHUNK_SIZE);
+            uint64_t sentBytes = 0;
+            uint64_t lastUiUs = 0;
+
+            while (sendOk && sentBytes < totalSize) {
+                if (fromServer && (!m_serverRunning || !m_clientAuthorized)) { sendOk = false; break; }
+                if (!fromServer && !m_clientRunning) { sendOk = false; break; }
+
+                DWORD toRead = (DWORD)std::min<uint64_t>(FILE_CHUNK_SIZE, totalSize - sentBytes);
+                DWORD bytesRead = 0;
+                if (!ReadFile(hFile, chunkBuf.data() + sizeof(FileChunkHeaderPayload), toRead, &bytesRead, nullptr) || bytesRead == 0) {
+                    sendOk = false;
+                    break;
+                }
+
+                auto* cHdr = reinterpret_cast<FileChunkHeaderPayload*>(chunkBuf.data());
+                cHdr->transferId = transferId;
+                cHdr->offset = sentBytes;
+                cHdr->chunkSize = bytesRead;
+
+                CryptoEngine::StreamCrypt(chunkBuf.data() + sizeof(FileChunkHeaderPayload), bytesRead, keyPtr, 5 ^ sentBytes);
+
+                uint32_t totalPayload = sizeof(FileChunkHeaderPayload) + bytesRead;
+                ControlHeader pktHdr = { MAGIC_CONTROL, CTRL_FILE_CHUNK, totalPayload };
+                {
+                    std::lock_guard<std::mutex> lock(mtxRef);
+                    sendOk = SendAllTcp(sockRef, &pktHdr, sizeof(pktHdr)) &&
+                             SendAllTcp(sockRef, chunkBuf.data(), totalPayload);
+                }
+                if (!sendOk) break;
+
+                sentBytes += bytesRead;
+                uint64_t now = NowMicros();
+                if (now - lastUiUs > 150000ULL || sentBytes == totalSize) {
+                    lastUiUs = now;
+                    int pct = (totalSize > 0) ? (int)((sentBytes * 100ULL) / totalSize) : 100;
+                    std::wstringstream ss;
+                    ss << L"Отправка: " << baseName << L" [" << pct << L"%, "
+                       << std::fixed << std::setprecision(1) << (sentBytes / 1048576.0)
+                       << L" / " << (totalSize / 1048576.0) << L" МБ]";
+                    SetFileStatus(fromServer, ss.str());
+                }
+            }
+
+            CloseHandle(hFile);
+
+            // 3. Пакет завершения (CTRL_FILE_END)
+            if (sockRef != INVALID_SOCKET) {
+                FileEndPayload endPkt = { transferId, (uint8_t)(sendOk ? 1 : 0) };
+                ControlHeader endHdr = { MAGIC_CONTROL, CTRL_FILE_END, sizeof(endPkt) };
+                std::lock_guard<std::mutex> lock(mtxRef);
+                SendAllTcp(sockRef, &endHdr, sizeof(endHdr));
+                SendAllTcp(sockRef, &endPkt, sizeof(endPkt));
+            }
+
+            SetFileStatus(fromServer, sendOk
+                ? (L"Файл успешно отправлен: " + baseName)
+                : (L"Ошибка при отправке файла: " + baseName));
+
+            if (fromServer) m_srvSendingFile = false;
+            else            m_cliSendingFile = false;
+        }).detach();
+    }
+
     // ========================================================================
-    // СИСТЕМНЫЙ ТРЕЙ И СВОРАЧИВАНИЕ ПАНЕЛИ БЕЗ ОСТАНОВКИ ДОСТУПА
+    // СИСТЕМНЫЙ ТРЕЙ
     // ========================================================================
     void ShowInTray(bool hideWindow) {
         if (!m_trayAdded) {
@@ -1798,9 +1841,7 @@ public:
             Shell_NotifyIconW(NIM_ADD, &nid);
             m_trayAdded = true;
         }
-        if (hideWindow) {
-            ShowWindow(m_hwndMain, SW_HIDE);
-        }
+        if (hideWindow) ShowWindow(m_hwndMain, SW_HIDE);
     }
 
     void RestoreFromTray() {
@@ -1847,7 +1888,7 @@ public:
             listen(m_srvListenTcp, 1) == SOCKET_ERROR) {
             closesocket(m_srvListenTcp);
             m_srvListenTcp = INVALID_SOCKET;
-            MessageBoxW(m_hwndMain, L"Не удалось занять порт сервера! Проверьте, не запущен ли другой экземпляр.", L"Ошибка", MB_ICONERROR);
+            MessageBoxW(m_hwndMain, L"Не удалось занять порт сервера!", L"Ошибка", MB_ICONERROR);
             return;
         }
 
@@ -1878,7 +1919,6 @@ public:
         m_srvCaptureThread   = std::thread(&RemoteDesktopApp::ServerCaptureAndEncodeLoop, this);
 
         UpdateStatusLabels();
-
         if (SendMessageW(m_chkAutoMin, BM_GETCHECK, 0, 0) == BST_CHECKED) {
             ShowWindow(m_hwndMain, SW_MINIMIZE);
         }
@@ -1919,7 +1959,6 @@ public:
                 resp.port = m_serverPort;
                 resp.width = GetSystemMetrics(SM_CXSCREEN);
                 resp.height = GetSystemMetrics(SM_CYSCREEN);
-
                 sendto(m_srvDiscUdp, (const char*)&resp, sizeof(resp), 0, (sockaddr*)&from, fromLen);
             }
         }
@@ -1977,10 +2016,8 @@ public:
 
             std::vector<uint8_t> pwdSalt(password.begin(), password.end());
             pwdSalt.insert(pwdSalt.end(), chal.salt, chal.salt + 32);
-            uint8_t pwdHash[32] = {};
+            uint8_t pwdHash[32] = {}, expectedHmac[32] = {};
             CryptoEngine::ComputeSHA256(pwdSalt.data(), pwdSalt.size(), pwdHash);
-
-            uint8_t expectedHmac[32] = {};
             CryptoEngine::ComputeHMACSHA256(pwdHash, 32, chal.challenge, 32, expectedHmac);
 
             bool authOk = (memcmp(expectedHmac, resp.hmac, 32) == 0);
@@ -2027,16 +2064,14 @@ public:
 
             bool isLoopbackTest = (m_connectedClientIp == "127.0.0.1" ||
                                    (m_clientRunning.load() && m_connectedClientIp == DetectRadminVpnIP()));
+            FileTransferReceiver fileReceiver;
 
             while (m_serverRunning && m_clientAuthorized) {
                 ControlHeader cHdr = {};
-                if (!RecvAllTcp(clientSock, &cHdr, sizeof(cHdr)) || cHdr.magic != MAGIC_CONTROL) {
-                    break;
-                }
+                if (!RecvAllTcp(clientSock, &cHdr, sizeof(cHdr)) || cHdr.magic != MAGIC_CONTROL) break;
 
                 RECT deskRect = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
-                bool localSelfViewerActive = (m_clientRunning.load() && IsWindowVisible(m_hwndViewer));
-                bool blockSelfInput = isLoopbackTest || localSelfViewerActive;
+                bool blockSelfInput = isLoopbackTest || (m_clientRunning.load() && IsWindowVisible(m_hwndViewer));
 
                 if (cHdr.type == CTRL_MOUSE_EVENT && cHdr.payloadSize == sizeof(MouseEventPayload)) {
                     MouseEventPayload mev = {};
@@ -2074,12 +2109,38 @@ public:
                         CryptoEngine::StreamCrypt(clipData.data(), clipData.size(), m_srvSessionKey, 3);
                         m_inputAndClip.ApplyRemoteClipboard(m_hwndMain, clipHdr.dataType, clipData, clipHdr.sha256);
                     }
+                } else if (cHdr.type == CTRL_FILE_START && cHdr.payloadSize == sizeof(FileStartPayload)) {
+                    FileStartPayload fStart = {};
+                    if (!RecvAllTcp(clientSock, &fStart, sizeof(fStart))) break;
+                    CryptoEngine::StreamCrypt(reinterpret_cast<uint8_t*>(&fStart), sizeof(fStart), m_srvSessionKey, 4);
+                    std::wstring status;
+                    fileReceiver.OnFileStart(fStart, status);
+                    SetFileStatus(true, status);
+                } else if (cHdr.type == CTRL_FILE_CHUNK && cHdr.payloadSize > sizeof(FileChunkHeaderPayload)) {
+                    FileChunkHeaderPayload chunkHdr = {};
+                    if (!RecvAllTcp(clientSock, &chunkHdr, sizeof(chunkHdr))) break;
+                    uint32_t dataLen = cHdr.payloadSize - sizeof(FileChunkHeaderPayload);
+                    if (dataLen != chunkHdr.chunkSize || dataLen > FILE_CHUNK_SIZE * 2) break;
+                    std::vector<uint8_t> chunkData(dataLen);
+                    if (!RecvAllTcp(clientSock, chunkData.data(), dataLen)) break;
+                    CryptoEngine::StreamCrypt(chunkData.data(), dataLen, m_srvSessionKey, 5 ^ chunkHdr.offset);
+                    std::wstring status;
+                    bool notifyUi = false;
+                    fileReceiver.OnFileChunk(chunkHdr, chunkData.data(), status, notifyUi);
+                    if (notifyUi) SetFileStatus(true, status);
+                } else if (cHdr.type == CTRL_FILE_END && cHdr.payloadSize == sizeof(FileEndPayload)) {
+                    FileEndPayload fEnd = {};
+                    if (!RecvAllTcp(clientSock, &fEnd, sizeof(fEnd))) break;
+                    std::wstring status;
+                    fileReceiver.OnFileEnd(fEnd, status);
+                    SetFileStatus(true, status);
                 } else if (cHdr.payloadSize > 0) {
                     std::vector<uint8_t> skip(std::min<uint32_t>(cHdr.payloadSize, MAX_CLIPBOARD_BYTES));
                     if (!RecvAllTcp(clientSock, skip.data(), skip.size())) break;
                 }
             }
 
+            fileReceiver.CloseActiveFile();
             m_inputAndClip.ReleaseAllHeldKeys();
             m_clientAuthorized = false;
             m_connectedClientIp.clear();
@@ -2101,21 +2162,14 @@ public:
         LowLatencyH264Encoder encoder;
         bool encoderReady = false;
 
-        std::vector<uint8_t> nv12Buffer;
-        std::vector<uint8_t> h264Stream;
-        uint32_t frameId = 1;
-        uint32_t framesInSec = 0;
-        uint64_t secTimer = NowMicros();
-        uint64_t lastPingUs = 0;
+        std::vector<uint8_t> nv12Buffer, h264Stream;
+        uint32_t frameId = 1, framesInSec = 0;
+        uint64_t secTimer = NowMicros(), lastPingUs = 0;
 
         while (m_serverRunning) {
-            if (!m_clientAuthorized) {
-                Sleep(15);
-                continue;
-            }
+            if (!m_clientAuthorized) { Sleep(15); continue; }
 
             uint64_t loopStartUs = NowMicros();
-
             if (loopStartUs - lastPingUs > 500000 && m_srvClientTcp != INVALID_SOCKET) {
                 lastPingUs = loopStartUs;
                 PingPongPayload ping = { loopStartUs, 0 };
@@ -2127,7 +2181,6 @@ public:
 
             bool needIdr = m_forceIdrNextFrame.load();
             uint32_t capW = 0, capH = 0;
-
             if (!capturer.CaptureToNv12(nv12Buffer, capW, capH, needIdr)) {
                 Sleep(1);
                 continue;
@@ -2137,10 +2190,7 @@ public:
                 encoderReady = encoder.Initialize(capW, capH, 60);
                 needIdr = true;
             }
-            if (!encoderReady) {
-                Sleep(10);
-                continue;
-            }
+            if (!encoderReady) { Sleep(10); continue; }
 
             if (needIdr) {
                 m_forceIdrNextFrame = false;
@@ -2170,7 +2220,7 @@ public:
                         size_t offset = (size_t)idx * MAX_UDP_PAYLOAD;
                         uint16_t chunkLen = (uint16_t)std::min<size_t>(MAX_UDP_PAYLOAD, totalBytes - offset);
 
-                        UdpVideoHeader* vHdr = reinterpret_cast<UdpVideoHeader*>(packetBuf);
+                        auto* vHdr = reinterpret_cast<UdpVideoHeader*>(packetBuf);
                         vHdr->magic = MAGIC_VIDEO;
                         vHdr->sessionToken = m_activeUdpToken;
                         vHdr->frameId = frameId;
@@ -2187,10 +2237,7 @@ public:
                         sendto(m_srvVideoUdp, (const char*)packetBuf, sizeof(UdpVideoHeader) + chunkLen,
                                0, (sockaddr*)&targetAddr, sizeof(targetAddr));
 
-                        // Микро-пейсинг пакетов для защиты буфера виртуального адаптера Radmin VPN от переполнения на IDR-кадрах
-                        if ((idx & 15) == 15) {
-                            MicroSpinWait(80);
-                        }
+                        if ((idx & 15) == 15) MicroSpinWait(80);
                     }
                     frameId++;
                     framesInSec++;
@@ -2223,7 +2270,6 @@ public:
         std::thread([this]() {
             SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             if (s == INVALID_SOCKET) return;
-
             BOOL bcast = TRUE;
             setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char*)&bcast, sizeof(bcast));
             DWORD timeoutMs = 450;
@@ -2233,10 +2279,7 @@ public:
             std::vector<std::string> bcastTargets;
             DetectRadminVpnIP(&bcastTargets);
 
-            DiscoveryPacket req = {};
-            req.magic = MAGIC_DISCOVERY;
-            req.isResponse = 0;
-
+            DiscoveryPacket req = { MAGIC_DISCOVERY, 0 };
             for (const auto& addrStr : bcastTargets) {
                 sockaddr_in dst = {};
                 dst.sin_family = AF_INET;
@@ -2270,12 +2313,8 @@ public:
                         }
                         if (!exists) m_discoveredHosts.push_back(info);
                     }
-                    if (!exists) {
-                        PostMessageW(m_hwndMain, WM_APP_HOST_FOUND, 0, 0);
-                    }
-                } else if (r <= 0) {
-                    break;
-                }
+                    if (!exists) PostMessageW(m_hwndMain, WM_APP_HOST_FOUND, 0, 0);
+                } else if (r <= 0) break;
             }
             closesocket(s);
         }).detach();
@@ -2289,13 +2328,12 @@ public:
         GetWindowTextA(m_editCliPort, portBuf, sizeof(portBuf));
         GetWindowTextA(m_editCliPass, passBuf, sizeof(passBuf));
 
-        std::string hostIp = ipBuf;
+        std::string hostIp = ipBuf, password = passBuf;
         uint16_t port = (uint16_t)std::atoi(portBuf);
         if (port == 0) port = DEFAULT_STREAM_PORT;
-        std::string password = passBuf;
 
         if (hostIp.empty()) {
-            MessageBoxW(m_hwndMain, L"Выберите сервер из списка или введите IP-адрес Radmin VPN!", L"Внимание", MB_ICONWARNING);
+            MessageBoxW(m_hwndMain, L"Выберите сервер из списка или введите IP-адрес!", L"Внимание", MB_ICONWARNING);
             return;
         }
 
@@ -2306,13 +2344,8 @@ public:
         sockaddr_in srvAddr = {};
         srvAddr.sin_family = AF_INET;
         srvAddr.sin_port = htons(port);
-        if (inet_pton(AF_INET, hostIp.c_str(), &srvAddr.sin_addr) <= 0) {
-            closesocket(tcpSock);
-            MessageBoxW(m_hwndMain, L"Некорректный формат IP-адреса!", L"Ошибка", MB_ICONERROR);
-            return;
-        }
-
-        if (connect(tcpSock, (sockaddr*)&srvAddr, sizeof(srvAddr)) == SOCKET_ERROR) {
+        if (inet_pton(AF_INET, hostIp.c_str(), &srvAddr.sin_addr) <= 0 ||
+            connect(tcpSock, (sockaddr*)&srvAddr, sizeof(srvAddr)) == SOCKET_ERROR) {
             closesocket(tcpSock);
             MessageBoxW(m_hwndMain, L"Не удалось подключиться к серверу по TCP!", L"Ошибка подключения", MB_ICONERROR);
             return;
@@ -2323,10 +2356,8 @@ public:
         setsockopt(udpSock, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvBuf, sizeof(rcvBuf));
         DisableUdpConnReset(udpSock);
 
-        sockaddr_in localUdp = {};
-        localUdp.sin_family = AF_INET;
+        sockaddr_in localUdp = { AF_INET, 0 };
         localUdp.sin_addr.s_addr = INADDR_ANY;
-        localUdp.sin_port = 0;
         bind(udpSock, (sockaddr*)&localUdp, sizeof(localUdp));
 
         sockaddr_in boundUdp = {};
@@ -2372,7 +2403,6 @@ public:
         m_cliTcpSock = tcpSock;
         m_cliUdpSock = udpSock;
 
-        // Адаптивное масштабирование окна вьювера под рабочий стол клиента с учетом пропорций сервера
         PositionViewerWindowAdaptively(chal.screenWidth, chal.screenHeight);
         ShowWindow(m_hwndViewer, SW_SHOW);
         SetForegroundWindow(m_hwndViewer);
@@ -2383,13 +2413,11 @@ public:
 
         m_cliTcpThread = std::thread(&RemoteDesktopApp::ClientTcpControlLoop, this);
         m_cliUdpThread = std::thread(&RemoteDesktopApp::ClientUdpVideoLoop, this, srvAddr);
-
         UpdateStatusLabels();
     }
 
     void PositionViewerWindowAdaptively(uint32_t remoteW, uint32_t remoteH) {
         if (m_isViewerFullscreen) ToggleViewerFullscreen();
-
         RECT workArea = {};
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
         int maxW = (int)((workArea.right - workArea.left) * 0.88);
@@ -2398,20 +2426,15 @@ public:
         double aspect = (remoteW > 0 && remoteH > 0) ? ((double)remoteW / remoteH) : (16.0 / 9.0);
         int winW = maxW;
         int winH = (int)(winW / aspect);
-        if (winH > maxH) {
-            winH = maxH;
-            winW = (int)(winH * aspect);
-        }
+        if (winH > maxH) { winH = maxH; winW = (int)(winH * aspect); }
 
         int posX = workArea.left + ((workArea.right - workArea.left) - winW) / 2;
         int posY = workArea.top + ((workArea.bottom - workArea.top) - winH) / 2;
-
         SetWindowPos(m_hwndViewer, HWND_TOP, posX, posY, winW, winH, SWP_NOACTIVATE);
     }
 
     void DisconnectClient() {
         if (!m_clientRunning.exchange(false)) return;
-
         SendClientReleaseAllKeys();
 
         if (m_cliTcpSock != INVALID_SOCKET) {
@@ -2435,12 +2458,11 @@ public:
 
     void ClientTcpControlLoop() {
         uint64_t lastPingSent = 0;
+        FileTransferReceiver fileReceiver;
 
         while (m_clientRunning) {
             ControlHeader cHdr = {};
-            if (!RecvAllTcp(m_cliTcpSock, &cHdr, sizeof(cHdr)) || cHdr.magic != MAGIC_CONTROL) {
-                break;
-            }
+            if (!RecvAllTcp(m_cliTcpSock, &cHdr, sizeof(cHdr)) || cHdr.magic != MAGIC_CONTROL) break;
 
             if (cHdr.type == CTRL_PING && cHdr.payloadSize == sizeof(PingPongPayload)) {
                 PingPongPayload ping = {};
@@ -2477,15 +2499,39 @@ public:
                     CryptoEngine::StreamCrypt(clipData.data(), clipData.size(), m_cliSessionKey, 3);
                     m_inputAndClip.ApplyRemoteClipboard(m_hwndMain, clipHdr.dataType, clipData, clipHdr.sha256);
                 }
+            } else if (cHdr.type == CTRL_FILE_START && cHdr.payloadSize == sizeof(FileStartPayload)) {
+                FileStartPayload fStart = {};
+                if (!RecvAllTcp(m_cliTcpSock, &fStart, sizeof(fStart))) break;
+                CryptoEngine::StreamCrypt(reinterpret_cast<uint8_t*>(&fStart), sizeof(fStart), m_cliSessionKey, 4);
+                std::wstring status;
+                fileReceiver.OnFileStart(fStart, status);
+                SetFileStatus(false, status);
+            } else if (cHdr.type == CTRL_FILE_CHUNK && cHdr.payloadSize > sizeof(FileChunkHeaderPayload)) {
+                FileChunkHeaderPayload chunkHdr = {};
+                if (!RecvAllTcp(m_cliTcpSock, &chunkHdr, sizeof(chunkHdr))) break;
+                uint32_t dataLen = cHdr.payloadSize - sizeof(FileChunkHeaderPayload);
+                if (dataLen != chunkHdr.chunkSize || dataLen > FILE_CHUNK_SIZE * 2) break;
+                std::vector<uint8_t> chunkData(dataLen);
+                if (!RecvAllTcp(m_cliTcpSock, chunkData.data(), dataLen)) break;
+                CryptoEngine::StreamCrypt(chunkData.data(), dataLen, m_cliSessionKey, 5 ^ chunkHdr.offset);
+                std::wstring status;
+                bool notifyUi = false;
+                fileReceiver.OnFileChunk(chunkHdr, chunkData.data(), status, notifyUi);
+                if (notifyUi) SetFileStatus(false, status);
+            } else if (cHdr.type == CTRL_FILE_END && cHdr.payloadSize == sizeof(FileEndPayload)) {
+                FileEndPayload fEnd = {};
+                if (!RecvAllTcp(m_cliTcpSock, &fEnd, sizeof(fEnd))) break;
+                std::wstring status;
+                fileReceiver.OnFileEnd(fEnd, status);
+                SetFileStatus(false, status);
             } else if (cHdr.payloadSize > 0) {
                 std::vector<uint8_t> skip(std::min<uint32_t>(cHdr.payloadSize, MAX_CLIPBOARD_BYTES));
                 if (!RecvAllTcp(m_cliTcpSock, skip.data(), skip.size())) break;
             }
         }
 
-        if (m_clientRunning) {
-            PostMessageW(m_hwndMain, WM_APP_CLIENT_LOST, 0, 0);
-        }
+        fileReceiver.CloseActiveFile();
+        if (m_clientRunning) PostMessageW(m_hwndMain, WM_APP_CLIENT_LOST, 0, 0);
     }
 
     void ClientUdpVideoLoop(sockaddr_in srvUdpAddr) {
@@ -2504,22 +2550,18 @@ public:
 
         struct FrameReassembly {
             uint32_t frameId = 0;
-            uint16_t totalChunks = 0;
-            uint16_t receivedChunks = 0;
+            uint16_t totalChunks = 0, receivedChunks = 0;
             uint8_t  flags = 0;
-            uint16_t width = 0;
-            uint16_t height = 0;
+            uint16_t width = 0, height = 0;
             uint32_t encodeUs = 0;
             std::vector<bool> chunkMask;
             std::vector<uint8_t> buffer;
         } currentFrame;
 
         uint8_t recvBuf[2048];
-        uint32_t expectedFrameId = 0;
-        bool waitingForKeyframe = true; // Защита от разваливания изображения при потере UDP-пакетов
-        uint32_t fpsCounter = 0;
-        uint64_t fpsTimer = NowMicros();
-        uint64_t lastHelloUs = NowMicros();
+        uint32_t expectedFrameId = 0, fpsCounter = 0;
+        bool waitingForKeyframe = true;
+        uint64_t fpsTimer = NowMicros(), lastHelloUs = NowMicros();
 
         DWORD rcvTimeoutMs = 150;
         setsockopt(m_cliUdpSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTimeoutMs, sizeof(rcvTimeoutMs));
@@ -2540,7 +2582,7 @@ public:
             }
 
             if (r < (int)sizeof(UdpVideoHeader)) continue;
-            const UdpVideoHeader* hdr = reinterpret_cast<const UdpVideoHeader*>(recvBuf);
+            const auto* hdr = reinterpret_cast<const UdpVideoHeader*>(recvBuf);
             if (hdr->magic != MAGIC_VIDEO || hdr->sessionToken != m_cliUdpToken) continue;
             if (hdr->chunkIdx >= hdr->totalChunks || hdr->totalChunks == 0) continue;
             if (r < (int)(sizeof(UdpVideoHeader) + hdr->payloadSize)) continue;
@@ -2567,7 +2609,6 @@ public:
 
                 size_t dstOffset = (size_t)hdr->chunkIdx * MAX_UDP_PAYLOAD;
                 memcpy(currentFrame.buffer.data() + dstOffset, recvBuf + sizeof(UdpVideoHeader), hdr->payloadSize);
-
                 if (hdr->chunkIdx == hdr->totalChunks - 1) {
                     currentFrame.buffer.resize(dstOffset + hdr->payloadSize);
                 }
@@ -2575,13 +2616,11 @@ public:
 
             if (currentFrame.receivedChunks == currentFrame.totalChunks) {
                 bool isIdr = (currentFrame.flags & 0x01) != 0;
-
                 if (!isIdr && expectedFrameId != 0 && currentFrame.frameId != expectedFrameId) {
                     waitingForKeyframe = true;
                     RequestServerKeyframe();
                 }
 
-                // Декодируем только непрерывную цепочку кадров от последнего IDR (исключает рассыпание квадратами)
                 if (isIdr || !waitingForKeyframe) {
                     waitingForKeyframe = false;
                     expectedFrameId = currentFrame.frameId + 1;
@@ -2600,7 +2639,6 @@ public:
                 } else {
                     RequestServerKeyframe();
                 }
-
                 currentFrame.frameId = 0;
             }
 
@@ -2611,16 +2649,14 @@ public:
                 PostMessageW(m_hwndMain, WM_APP_UPDATE_UI, 0, 0);
             }
         }
-
         CoUninitialize();
     }
 
     void RequestServerKeyframe() {
         if (!m_clientRunning || m_cliTcpSock == INVALID_SOCKET) return;
         uint64_t now = NowMicros();
-        if (now - m_lastIdrReqUs < 120000ULL) return; // Не чаще 1 раза в 120 мс
+        if (now - m_lastIdrReqUs < 120000ULL) return;
         m_lastIdrReqUs = now;
-
         ControlHeader hdr = { MAGIC_CONTROL, CTRL_REQ_IDR, 0 };
         std::lock_guard<std::mutex> lock(m_cliTcpSendMutex);
         SendAllTcp(m_cliTcpSock, &hdr, sizeof(hdr));
@@ -2631,15 +2667,9 @@ public:
         float normX = 0.0f, normY = 0.0f;
         if (!m_renderer.MapWindowPointToNormalized(clientX, clientY, normX, normY)) return;
 
-        MouseEventPayload ev = {};
-        ev.normX = normX;
-        ev.normY = normY;
-        ev.wheelDelta = wheelDelta;
-        ev.flags = buttonFlags;
-
+        MouseEventPayload ev = { normX, normY, 0, 0, wheelDelta, buttonFlags };
         CryptoEngine::StreamCrypt(reinterpret_cast<uint8_t*>(&ev), sizeof(ev), m_cliSessionKey, 1);
         ControlHeader hdr = { MAGIC_CONTROL, CTRL_MOUSE_EVENT, sizeof(ev) };
-
         std::lock_guard<std::mutex> lock(m_cliTcpSendMutex);
         SendAllTcp(m_cliTcpSock, &hdr, sizeof(hdr));
         SendAllTcp(m_cliTcpSock, &ev, sizeof(ev));
@@ -2648,10 +2678,8 @@ public:
     void SendClientKeyEvent(uint16_t scanCode, uint16_t vKey, bool isDown, bool isExtended) {
         if (!m_clientRunning || m_cliTcpSock == INVALID_SOCKET) return;
         KeyEventPayload ev = { scanCode, vKey, (uint8_t)(isDown ? 1 : 0), (uint8_t)(isExtended ? 1 : 0) };
-
         CryptoEngine::StreamCrypt(reinterpret_cast<uint8_t*>(&ev), sizeof(ev), m_cliSessionKey, 2);
         ControlHeader hdr = { MAGIC_CONTROL, CTRL_KEY_EVENT, sizeof(ev) };
-
         std::lock_guard<std::mutex> lock(m_cliTcpSendMutex);
         SendAllTcp(m_cliTcpSock, &hdr, sizeof(hdr));
         SendAllTcp(m_cliTcpSock, &ev, sizeof(ev));
@@ -2668,14 +2696,11 @@ public:
         uint8_t fmt = 0;
         std::vector<uint8_t> data;
         uint8_t hash[32] = {};
-
         if (!m_inputAndClip.CaptureClipboardIfChanged(m_hwndMain, fmt, data, hash)) return;
 
-        ClipboardHeaderPayload clipHdr = {};
-        clipHdr.dataType = fmt;
+        ClipboardHeaderPayload clipHdr = { fmt };
         memcpy(clipHdr.sha256, hash, 32);
         clipHdr.dataSize = (uint32_t)data.size();
-
         ControlHeader hdr = { MAGIC_CONTROL, CTRL_CLIPBOARD_DATA, (uint32_t)(sizeof(clipHdr) + data.size()) };
 
         if (m_serverRunning && m_clientAuthorized && m_srvClientTcp != INVALID_SOCKET) {
@@ -2686,7 +2711,6 @@ public:
             SendAllTcp(m_srvClientTcp, &clipHdr, sizeof(clipHdr));
             SendAllTcp(m_srvClientTcp, encData.data(), encData.size());
         }
-
         if (m_clientRunning && m_cliTcpSock != INVALID_SOCKET) {
             std::vector<uint8_t> encData = data;
             CryptoEngine::StreamCrypt(encData.data(), encData.size(), m_cliSessionKey, 3);
@@ -2705,12 +2729,9 @@ public:
             HMONITOR hMon = MonitorFromWindow(m_hwndViewer, MONITOR_DEFAULTTONEAREST);
             MONITORINFO mi = { sizeof(mi) };
             GetMonitorInfoW(hMon, &mi);
-
             SetWindowLongW(m_hwndViewer, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
-            SetWindowPos(m_hwndViewer, HWND_TOP,
-                         mi.rcMonitor.left, mi.rcMonitor.top,
-                         mi.rcMonitor.right - mi.rcMonitor.left,
-                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+            SetWindowPos(m_hwndViewer, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
                          SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
             m_isViewerFullscreen = true;
         } else {
@@ -2723,7 +2744,7 @@ public:
     }
 
     // ========================================================================
-    // АДАПТИВНАЯ КОМПОНОВКА ОКНА ПОДКЛЮЧЕНИЯ (РЕСАЙЗ + DPI SCALING)
+    // АДАПТИВНАЯ КОМПОНОВКА ОКНА
     // ========================================================================
     void UpdateFontsForDpi(UINT dpi) {
         int fontHeight = -MulDiv(10, dpi, 72);
@@ -2741,7 +2762,8 @@ public:
             m_lblCliPass, m_editCliPass, m_lblCliStatus
         };
         HWND boldCtrls[] = {
-            m_grpServer, m_btnSrvToggle, m_grpClient, m_btnCliScan, m_btnCliConnect
+            m_grpServer, m_btnSrvToggle, m_btnSrvSendFile,
+            m_grpClient, m_btnCliScan, m_btnCliConnect, m_btnCliSendFile
         };
 
         for (HWND h : normalCtrls) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)newFont, TRUE);
@@ -2757,37 +2779,28 @@ public:
         if (!m_hwndMain || !m_grpServer) return;
         RECT rc = {};
         GetClientRect(m_hwndMain, &rc);
-        int cw = rc.right - rc.left;
-        int ch = rc.bottom - rc.top;
+        int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
         if (cw <= 50 || ch <= 50) return;
 
         UINT dpi = GetDpiForWindow(m_hwndMain);
         auto S = [&](int v) { return MulDiv(v, dpi, 96); };
 
-        int margin = S(12);
-        int gap = S(12);
+        int margin = S(12), gap = S(12);
         int colW = (cw - margin * 2 - gap) / 2;
         int grpH = ch - margin * 2;
+        int leftX = margin, rightX = margin + colW + gap;
+        int innerPad = S(14), rowH = S(26), btnH = S(32), vStep = S(32);
 
-        int leftX = margin;
-        int rightX = margin + colW + gap;
-        int innerPad = S(14);
-        int rowH = S(26);
-        int btnH = S(34);
-        int vStep = S(34);
-
-        HDWP hdwp = BeginDeferWindowPos(22);
+        HDWP hdwp = BeginDeferWindowPos(24);
         auto Place = [&](HWND h, int x, int y, int w, int ht) {
             if (h) hdwp = DeferWindowPos(hdwp, h, nullptr, x, y, std::max(10, w), std::max(10, ht), SWP_NOZORDER | SWP_NOACTIVATE);
         };
 
         // Левая колонка: Сервер
         Place(m_grpServer, leftX, margin, colW, grpH);
-        int sx = leftX + innerPad;
-        int sw = colW - innerPad * 2;
-        int lblW = std::min(S(155), sw / 2);
-        int edtW = sw - lblW - S(6);
-        int sy = margin + S(28);
+        int sx = leftX + innerPad, sw = colW - innerPad * 2;
+        int lblW = std::min(S(155), sw / 2), edtW = sw - lblW - S(6);
+        int sy = margin + S(26);
 
         Place(m_lblSrvName,  sx, sy + S(3), lblW, rowH);
         Place(m_editSrvName, sx + lblW + S(6), sy, edtW, rowH);
@@ -2801,28 +2814,30 @@ public:
         Place(m_editSrvPort, sx + lblW + S(6), sy, edtW, rowH);
         sy += vStep;
 
-        Place(m_chkAutoMin, sx, sy, sw, S(24));
-        sy += S(28);
+        Place(m_chkAutoMin, sx, sy, sw, S(22));
+        sy += S(26);
 
         int halfBtnW = (sw - S(8)) / 2;
         Place(m_btnSrvToggle, sx, sy, halfBtnW, btnH);
         Place(m_btnSrvTray,   sx + halfBtnW + S(8), sy, sw - halfBtnW - S(8), btnH);
-        sy += btnH + S(10);
+        sy += btnH + S(6);
+
+        Place(m_btnSrvSendFile, sx, sy, sw, btnH);
+        sy += btnH + S(8);
 
         int srvStatusH = (margin + grpH) - sy - innerPad;
-        Place(m_lblSrvStatus, sx, sy, sw, std::max(S(50), srvStatusH));
+        Place(m_lblSrvStatus, sx, sy, sw, std::max(S(55), srvStatusH));
 
         // Правая колонка: Клиент
         Place(m_grpClient, rightX, margin, colW, grpH);
-        int cx = rightX + innerPad;
-        int clW = colW - innerPad * 2;
+        int cx = rightX + innerPad, clW = colW - innerPad * 2;
         int cy = margin + S(26);
 
-        Place(m_btnCliScan, cx, cy, clW, S(30));
-        cy += S(36);
+        Place(m_btnCliScan, cx, cy, clW, S(28));
+        cy += S(34);
 
-        int bottomControlsH = vStep * 2 + btnH + S(60) + innerPad;
-        int listH = std::max(S(65), (margin + grpH) - cy - bottomControlsH);
+        int bottomControlsH = vStep * 2 + btnH + S(75) + innerPad;
+        int listH = std::max(S(60), (margin + grpH) - cy - bottomControlsH);
         Place(m_listHosts, cx, cy, clW, listH);
         cy += listH + S(8);
 
@@ -2838,11 +2853,13 @@ public:
         Place(m_editCliPass, cx + cliLblW + S(6), cy, clW - cliLblW - S(6), rowH);
         cy += vStep;
 
-        Place(m_btnCliConnect, cx, cy, clW, btnH);
+        int cliHalfBtn = (clW - S(8)) / 2;
+        Place(m_btnCliConnect,  cx, cy, cliHalfBtn, btnH);
+        Place(m_btnCliSendFile, cx + cliHalfBtn + S(8), cy, clW - cliHalfBtn - S(8), btnH);
         cy += btnH + S(8);
 
         int cliStatusH = (margin + grpH) - cy - innerPad;
-        Place(m_lblCliStatus, cx, cy, clW, std::max(S(40), cliStatusH));
+        Place(m_lblCliStatus, cx, cy, clW, std::max(S(50), cliStatusH));
 
         EndDeferWindowPos(hdwp);
         InvalidateRect(m_hwndMain, nullptr, TRUE);
@@ -2850,40 +2867,47 @@ public:
 
     void UpdateStatusLabels() {
         m_radminIp = DetectRadminVpnIP();
+        std::wstring srvFileStr, cliFileStr;
+        {
+            std::lock_guard<std::mutex> lock(m_fileStatusMutex);
+            srvFileStr = m_srvFileStatus;
+            cliFileStr = m_cliFileStatus;
+        }
 
         std::wstringstream srvSs;
         srvSs << L"IP в Radmin VPN: " << std::wstring(m_radminIp.begin(), m_radminIp.end())
               << L" : " << m_serverPort << L"\r\n";
         if (!m_serverRunning) {
-            srvSs << L"Статус: Сервер остановлен";
+            srvSs << L"Статус: Сервер остановлен\r\n" << srvFileStr;
         } else if (!m_clientAuthorized) {
-            srvSs << L"Статус: Ожидание подключения ( можно свернуть окно )\r\n"
-                  << L"UDP Discovery: порт " << DISCOVERY_UDP_PORT;
+            srvSs << L"Статус: Ожидание подключения (Discovery UDP:" << DISCOVERY_UDP_PORT << L")\r\n" << srvFileStr;
         } else {
             srvSs << L"Статус: Активен клиент [" << std::wstring(m_connectedClientIp.begin(), m_connectedClientIp.end()) << L"]\r\n"
                   << L"FPS: " << m_srvFps.load()
-                  << L" | Encode: " << std::fixed << std::setprecision(2) << (m_srvEncodeUs.load() / 1000.0) << L" мс"
-                  << L" | Decode: " << (m_srvClientDecodeUs.load() / 1000.0) << L" мс"
-                  << L" | RTT: " << (m_srvRttUs.load() / 1000.0) << L" мс";
+                  << L" | Enc: " << std::fixed << std::setprecision(1) << (m_srvEncodeUs.load() / 1000.0) << L"ms"
+                  << L" | Dec: " << (m_srvClientDecodeUs.load() / 1000.0) << L"ms"
+                  << L" | RTT: " << (m_srvRttUs.load() / 1000.0) << L"ms\r\n"
+                  << srvFileStr;
         }
         SetWindowTextW(m_lblSrvStatus, srvSs.str().c_str());
 
         std::wstringstream cliSs;
         if (!m_clientRunning) {
-            cliSs << L"Статус: Отключен. Нажмите «Поиск серверов» или введите IP.";
+            cliSs << L"Статус: Отключен. Нажмите «Поиск серверов» или введите IP.\r\n" << cliFileStr;
         } else {
             cliSs << L"Статус: Трансляция активна (Ctrl+Alt+F — полный экран)\r\n"
                   << L"FPS: " << m_cliFps.load()
-                  << L" | Encode: " << std::fixed << std::setprecision(2) << (m_cliEncodeUs.load() / 1000.0) << L" мс"
-                  << L" | Decode: " << (m_cliDecodeUs.load() / 1000.0) << L" мс"
-                  << L" | RTT: " << (m_cliRttUs.load() / 1000.0) << L" мс";
+                  << L" | Enc: " << std::fixed << std::setprecision(1) << (m_cliEncodeUs.load() / 1000.0) << L"ms"
+                  << L" | Dec: " << (m_cliDecodeUs.load() / 1000.0) << L"ms"
+                  << L" | RTT: " << (m_cliRttUs.load() / 1000.0) << L"ms\r\n"
+                  << cliFileStr;
 
             std::wstringstream titleSs;
             titleSs << L"Radmin Ultra-Low Latency Viewer — FPS: " << m_cliFps.load()
-                    << L" | Encode: " << std::fixed << std::setprecision(1) << (m_cliEncodeUs.load() / 1000.0) << L"ms"
-                    << L" | Decode: " << (m_cliDecodeUs.load() / 1000.0) << L"ms"
+                    << L" | Enc: " << std::fixed << std::setprecision(1) << (m_cliEncodeUs.load() / 1000.0) << L"ms"
+                    << L" | Dec: " << (m_cliDecodeUs.load() / 1000.0) << L"ms"
                     << L" | RTT: " << (m_cliRttUs.load() / 1000.0) << L"ms"
-                    << L" | [Ctrl+Alt+F - Полный экран]";
+                    << L" | [Ctrl+Alt+F - Полный экран | Drag&Drop файла]";
             SetWindowTextW(m_hwndViewer, titleSs.str().c_str());
         }
         SetWindowTextW(m_lblCliStatus, cliSs.str().c_str());
@@ -2893,49 +2917,49 @@ public:
 static RemoteDesktopApp g_app;
 
 // ============================================================================
-// ПЕРЕХВАТ КЛАВИШИ WINDOWS В АКТИВНОМ ОКНЕ ВЬЮВЕРА (ИСКЛЮЧАЕТ ЗАЛИПАНИЕ WIN)
+// ХУК КЛАВИШИ WINDOWS И ОКОННЫЕ ПРОЦЕДУРЫ WIN32
 // ============================================================================
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && g_app.m_clientRunning) {
-        KBDLLHOOKSTRUCT* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        auto* kb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
         if (kb && kb->dwExtraInfo != INJECTED_SIGNATURE) {
             if ((kb->vkCode == VK_LWIN || kb->vkCode == VK_RWIN) &&
                 GetForegroundWindow() == g_app.m_hwndViewer) {
                 bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
                 g_app.SendClientKeyEvent((uint16_t)kb->scanCode, (uint16_t)kb->vkCode, isDown, true);
-                return 1; // Подавляем локальное меню Пуск на клиенте, чтобы фокус не терялся
+                return 1;
             }
         }
     }
     return CallNextHookEx(g_app.m_hKeyboardHook, nCode, wParam, lParam);
 }
 
-// ============================================================================
-// ОКОННЫЕ ПРОЦЕДУРЫ WIN32
-// ============================================================================
 LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if ((msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) || (msg >= WM_KEYFIRST && msg <= WM_KEYLAST)) {
-        if (GetMessageExtraInfo() == INJECTED_SIGNATURE) {
-            return 0;
-        }
+        if (GetMessageExtraInfo() == INJECTED_SIGNATURE) return 0;
     }
 
     switch (msg) {
     case WM_SIZE:
-        if (wParam != SIZE_MINIMIZED) {
-            g_app.m_renderer.OnResize(LOWORD(lParam), HIWORD(lParam));
-        }
+        if (wParam != SIZE_MINIMIZED) g_app.m_renderer.OnResize(LOWORD(lParam), HIWORD(lParam));
         return 0;
 
-    // При потере фокуса окном вьювера немедленно отпускаем Win/Alt/Ctrl/Shift на сервере
+    case WM_DROPFILES: {
+        HDROP hDrop = (HDROP)wParam;
+        wchar_t droppedPath[MAX_PATH] = {};
+        if (DragQueryFileW(hDrop, 0, droppedPath, MAX_PATH)) {
+            g_app.SendFileAsync(droppedPath, false);
+        }
+        DragFinish(hDrop);
+        return 0;
+    }
+
     case WM_KILLFOCUS:
         g_app.SendClientReleaseAllKeys();
         return 0;
 
     case WM_ACTIVATE:
-        if (LOWORD(wParam) == WA_INACTIVE) {
-            g_app.SendClientReleaseAllKeys();
-        }
+        if (LOWORD(wParam) == WA_INACTIVE) g_app.SendClientReleaseAllKeys();
         return 0;
 
     case WM_CLOSE:
@@ -2985,19 +3009,14 @@ LRESULT CALLBACK ViewerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             g_app.ToggleViewerFullscreen();
             return 0;
         }
-        uint16_t scanCode = (uint16_t)((lParam >> 16) & 0xFF);
-        bool isExt = (lParam & (1 << 24)) != 0;
-        g_app.SendClientKeyEvent(scanCode, (uint16_t)wParam, true, isExt);
+        g_app.SendClientKeyEvent((uint16_t)((lParam >> 16) & 0xFF), (uint16_t)wParam, true, (lParam & (1 << 24)) != 0);
         return 0;
     }
 
     case WM_KEYUP:
-    case WM_SYSKEYUP: {
-        uint16_t scanCode = (uint16_t)((lParam >> 16) & 0xFF);
-        bool isExt = (lParam & (1 << 24)) != 0;
-        g_app.SendClientKeyEvent(scanCode, (uint16_t)wParam, false, isExt);
+    case WM_SYSKEYUP:
+        g_app.SendClientKeyEvent((uint16_t)((lParam >> 16) & 0xFF), (uint16_t)wParam, false, (lParam & (1 << 24)) != 0);
         return 0;
-    }
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -3007,13 +3026,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_CREATE: {
         g_app.m_hwndMain = hwnd;
         HINSTANCE hInst = GetModuleHandleW(nullptr);
-
         auto MakeCtrl = [&](LPCWSTR cls, LPCWSTR txt, DWORD style, int id) {
             return CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | style,
                                    0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)id, hInst, nullptr);
         };
 
-        // --- БЛОК 1: РЕЖИМ ХОСТА (СЕРВЕР) ---
+        // --- БЛОК 1: СЕРВЕР ---
         g_app.m_grpServer = MakeCtrl(L"BUTTON", L"[1] Создать сервер (Режим Хоста)", BS_GROUPBOX, IDC_GRP_SERVER);
 
         char compName[64] = "Radmin-PC";
@@ -3021,31 +3039,30 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         GetComputerNameA(compName, &compLen);
         std::wstring wCompName(compName, compName + strlen(compName));
 
-        g_app.m_lblSrvName  = MakeCtrl(L"STATIC", L"Имя машины / сервера:", 0, IDC_LBL_SRV_NAME);
-        g_app.m_editSrvName = MakeCtrl(L"EDIT", wCompName.c_str(), WS_BORDER | ES_AUTOHSCROLL, IDC_EDIT_SRV_NAME);
+        g_app.m_lblSrvName     = MakeCtrl(L"STATIC", L"Имя машины / сервера:", 0, IDC_LBL_SRV_NAME);
+        g_app.m_editSrvName    = MakeCtrl(L"EDIT", wCompName.c_str(), WS_BORDER | ES_AUTOHSCROLL, IDC_EDIT_SRV_NAME);
+        g_app.m_lblSrvPass     = MakeCtrl(L"STATIC", L"Пароль доступа:", 0, IDC_LBL_SRV_PASS);
+        g_app.m_editSrvPass    = MakeCtrl(L"EDIT", L"12345", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, IDC_EDIT_SRV_PASS);
+        g_app.m_lblSrvPort     = MakeCtrl(L"STATIC", L"Порт (TCP + UDP):", 0, IDC_LBL_SRV_PORT);
+        g_app.m_editSrvPort    = MakeCtrl(L"EDIT", L"27000", WS_BORDER | ES_NUMBER, IDC_EDIT_SRV_PORT);
+        g_app.m_chkAutoMin     = MakeCtrl(L"BUTTON", L"Сворачивать панель при подключении клиента", BS_AUTOCHECKBOX, IDC_CHK_AUTO_MIN);
+        g_app.m_btnSrvToggle   = MakeCtrl(L"BUTTON", L"Запустить сервер", BS_PUSHBUTTON, IDC_BTN_SRV_TOGGLE);
+        g_app.m_btnSrvTray     = MakeCtrl(L"BUTTON", L"Свернуть в трей", BS_PUSHBUTTON, IDC_BTN_SRV_TRAY);
+        g_app.m_btnSrvSendFile = MakeCtrl(L"BUTTON", L"Отправить файл клиенту...", BS_PUSHBUTTON, IDC_BTN_SRV_SENDFILE);
+        g_app.m_lblSrvStatus   = MakeCtrl(L"STATIC", L"", SS_LEFT, IDC_LBL_SRV_STATUS);
 
-        g_app.m_lblSrvPass  = MakeCtrl(L"STATIC", L"Пароль доступа:", 0, IDC_LBL_SRV_PASS);
-        g_app.m_editSrvPass = MakeCtrl(L"EDIT", L"12345", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, IDC_EDIT_SRV_PASS);
-
-        g_app.m_lblSrvPort  = MakeCtrl(L"STATIC", L"Порт (TCP + UDP):", 0, IDC_LBL_SRV_PORT);
-        g_app.m_editSrvPort = MakeCtrl(L"EDIT", L"27000", WS_BORDER | ES_NUMBER, IDC_EDIT_SRV_PORT);
-
-        g_app.m_chkAutoMin   = MakeCtrl(L"BUTTON", L"Сворачивать панель при подключении клиента", BS_AUTOCHECKBOX, IDC_CHK_AUTO_MIN);
-        g_app.m_btnSrvToggle = MakeCtrl(L"BUTTON", L"Запустить сервер", BS_PUSHBUTTON, IDC_BTN_SRV_TOGGLE);
-        g_app.m_btnSrvTray   = MakeCtrl(L"BUTTON", L"Свернуть в трей", BS_PUSHBUTTON, IDC_BTN_SRV_TRAY);
-        g_app.m_lblSrvStatus = MakeCtrl(L"STATIC", L"", SS_LEFT, IDC_LBL_SRV_STATUS);
-
-        // --- БЛОК 2: РЕЖИМ КЛИЕНТА ---
-        g_app.m_grpClient     = MakeCtrl(L"BUTTON", L"[2] Подключиться к ПК (Режим Клиента)", BS_GROUPBOX, IDC_GRP_CLIENT);
-        g_app.m_btnCliScan    = MakeCtrl(L"BUTTON", L"Поиск серверов в сети Radmin VPN", BS_PUSHBUTTON, IDC_BTN_CLI_SCAN);
-        g_app.m_listHosts     = MakeCtrl(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOTIFY, IDC_LIST_HOSTS);
-        g_app.m_lblCliIp      = MakeCtrl(L"STATIC", L"IP и порт хоста:", 0, IDC_LBL_CLI_IP);
-        g_app.m_editCliIp     = MakeCtrl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, IDC_EDIT_CLI_IP);
-        g_app.m_editCliPort   = MakeCtrl(L"EDIT", L"27000", WS_BORDER | ES_NUMBER, IDC_EDIT_CLI_PORT);
-        g_app.m_lblCliPass    = MakeCtrl(L"STATIC", L"Пароль сервера:", 0, IDC_LBL_CLI_PASS);
-        g_app.m_editCliPass   = MakeCtrl(L"EDIT", L"12345", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, IDC_EDIT_CLI_PASS);
-        g_app.m_btnCliConnect = MakeCtrl(L"BUTTON", L"Подключиться", BS_PUSHBUTTON, IDC_BTN_CLI_CONNECT);
-        g_app.m_lblCliStatus  = MakeCtrl(L"STATIC", L"", SS_LEFT, IDC_LBL_CLI_STATUS);
+        // --- БЛОК 2: КЛИЕНТ ---
+        g_app.m_grpClient      = MakeCtrl(L"BUTTON", L"[2] Подключиться к ПК (Режим Клиента)", BS_GROUPBOX, IDC_GRP_CLIENT);
+        g_app.m_btnCliScan     = MakeCtrl(L"BUTTON", L"Поиск серверов в сети Radmin VPN", BS_PUSHBUTTON, IDC_BTN_CLI_SCAN);
+        g_app.m_listHosts      = MakeCtrl(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOTIFY, IDC_LIST_HOSTS);
+        g_app.m_lblCliIp       = MakeCtrl(L"STATIC", L"IP и порт хоста:", 0, IDC_LBL_CLI_IP);
+        g_app.m_editCliIp      = MakeCtrl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, IDC_EDIT_CLI_IP);
+        g_app.m_editCliPort    = MakeCtrl(L"EDIT", L"27000", WS_BORDER | ES_NUMBER, IDC_EDIT_CLI_PORT);
+        g_app.m_lblCliPass     = MakeCtrl(L"STATIC", L"Пароль сервера:", 0, IDC_LBL_CLI_PASS);
+        g_app.m_editCliPass    = MakeCtrl(L"EDIT", L"12345", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, IDC_EDIT_CLI_PASS);
+        g_app.m_btnCliConnect  = MakeCtrl(L"BUTTON", L"Подключиться", BS_PUSHBUTTON, IDC_BTN_CLI_CONNECT);
+        g_app.m_btnCliSendFile = MakeCtrl(L"BUTTON", L"Отправить файл...", BS_PUSHBUTTON, IDC_BTN_CLI_SENDFILE);
+        g_app.m_lblCliStatus   = MakeCtrl(L"STATIC", L"", SS_LEFT, IDC_LBL_CLI_STATUS);
 
         g_app.UpdateFontsForDpi(GetDpiForWindow(hwnd));
         g_app.RelayoutMainWindow();
@@ -3057,22 +3074,19 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_GETMINMAXINFO: {
-        MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+        auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
         UINT dpi = GetDpiForWindow(hwnd);
-        mmi->ptMinTrackSize.x = MulDiv(720, dpi, 96);
-        mmi->ptMinTrackSize.y = MulDiv(360, dpi, 96);
+        mmi->ptMinTrackSize.x = MulDiv(760, dpi, 96);
+        mmi->ptMinTrackSize.y = MulDiv(410, dpi, 96);
         return 0;
     }
 
     case WM_SIZE:
-        if (wParam != SIZE_MINIMIZED) {
-            g_app.RelayoutMainWindow();
-        }
+        if (wParam != SIZE_MINIMIZED) g_app.RelayoutMainWindow();
         return 0;
 
     case WM_DPICHANGED: {
-        UINT newDpi = HIWORD(wParam);
-        g_app.UpdateFontsForDpi(newDpi);
+        g_app.UpdateFontsForDpi(HIWORD(wParam));
         const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
         SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
                      suggested->right - suggested->left, suggested->bottom - suggested->top,
@@ -3089,9 +3103,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
             AppendMenuW(hMenu, MF_STRING, IDM_TRAY_RESTORE, L"Развернуть панель управления");
-            if (g_app.m_serverRunning) {
-                AppendMenuW(hMenu, MF_STRING, IDM_TRAY_STOP_SRV, L"Остановить сервер");
-            }
+            if (g_app.m_serverRunning) AppendMenuW(hMenu, MF_STRING, IDM_TRAY_STOP_SRV, L"Остановить сервер");
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, IDM_TRAY_EXIT, L"Выход");
             SetForegroundWindow(hwnd);
@@ -3102,14 +3114,15 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_COMMAND: {
-        int id = LOWORD(wParam);
-        int code = HIWORD(wParam);
-
+        int id = LOWORD(wParam), code = HIWORD(wParam);
         if (id == IDC_BTN_SRV_TOGGLE && code == BN_CLICKED) {
-            if (!g_app.m_serverRunning) g_app.StartServer();
-            else g_app.StopServer();
+            if (!g_app.m_serverRunning) g_app.StartServer(); else g_app.StopServer();
         } else if (id == IDC_BTN_SRV_TRAY && code == BN_CLICKED) {
             g_app.ShowInTray(true);
+        } else if (id == IDC_BTN_SRV_SENDFILE && code == BN_CLICKED) {
+            g_app.PromptAndSendFile(true);
+        } else if (id == IDC_BTN_CLI_SENDFILE && code == BN_CLICKED) {
+            g_app.PromptAndSendFile(false);
         } else if (id == IDM_TRAY_RESTORE) {
             g_app.RestoreFromTray();
         } else if (id == IDM_TRAY_STOP_SRV) {
@@ -3127,8 +3140,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 SetWindowTextA(g_app.m_editCliPort, std::to_string(g_app.m_discoveredHosts[sel].port).c_str());
             }
         } else if (id == IDC_BTN_CLI_CONNECT && code == BN_CLICKED) {
-            if (!g_app.m_clientRunning) g_app.ConnectToServer();
-            else g_app.DisconnectClient();
+            if (!g_app.m_clientRunning) g_app.ConnectToServer(); else g_app.DisconnectClient();
         }
         return 0;
     }
@@ -3164,7 +3176,6 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_CLOSE:
-        // Если сервер активен, сворачиваем панель на панель задач вместо обрыва сессии, либо спрашиваем подтверждение
         if (g_app.m_serverRunning && g_app.m_clientAuthorized) {
             ShowWindow(hwnd, SW_MINIMIZE);
             return 0;
@@ -3214,26 +3225,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     wcViewer.lpszClassName = L"RadminUltraRD_Viewer";
     RegisterClassExW(&wcViewer);
 
-    // Адаптивный расчет стартового размера главного окна относительно текущего монитора и DPI
     RECT workArea = {};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
     int screenW = workArea.right - workArea.left;
     int screenH = workArea.bottom - workArea.top;
 
     UINT dpi = GetDpiForSystem();
-    int initW = std::min(screenW - 40, MulDiv(880, dpi, 96));
-    int initH = std::min(screenH - 40, MulDiv(420, dpi, 96));
+    int initW = std::min(screenW - 40, MulDiv(900, dpi, 96));
+    int initH = std::min(screenH - 40, MulDiv(450, dpi, 96));
     int initX = workArea.left + (screenW - initW) / 2;
     int initY = workArea.top + (screenH - initH) / 2;
 
     g_app.m_hwndViewer = CreateWindowExW(
-        0, L"RadminUltraRD_Viewer", L"Radmin Ultra-Low Latency Viewer",
+        WS_EX_ACCEPTFILES, L"RadminUltraRD_Viewer", L"Radmin Ultra-Low Latency Viewer",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1280, 720,
         nullptr, nullptr, hInstance, nullptr);
+    DragAcceptFiles(g_app.m_hwndViewer, TRUE);
 
     HWND hwndMain = CreateWindowExW(
         0, L"RadminUltraRD_Main",
-        L"Radmin VPN Ultra-Low Latency Remote Desktop (DXGI + H.264 Zero-Latency + UDP)",
+        L"Radmin VPN Ultra-Low Latency Remote Desktop (DXGI + H.264 Zero-Latency + UDP + File Transfer)",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         initX, initY, initW, initH,
         nullptr, nullptr, hInstance, nullptr);
