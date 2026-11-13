@@ -1,7 +1,7 @@
 // ============================================================================
 // RadminUltraRD.cpp — Ultra-Low Latency Remote Desktop (Host + Client + Files)
 // Компиляция (x64 Native Tools Command Prompt for VS):
-// cl.exe /O2 /Oi /EHsc /std:c++20 /DUNICODE /D_UNICODE RadminUltraRD.cpp /link /SUBSYSTEM:WINDOWS /OUT:RadminUltraRD.exe
+// cl.exe /O2 /Oi /EHsc /std:c++20 /DUNICODE /D_UNICODE C:\Users\listf\Desktop\RadminUltraRD.cpp /link /SUBSYSTEM:WINDOWS /OUT:C:\Users\listf\Desktop\RadminUltraRD.exe
 // ============================================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -20,11 +20,14 @@
 #include <mmsystem.h>
 #include <commctrl.h>
 #include <bcrypt.h>
+#include <dwmapi.h>
 
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
+#include <d2d1.h>
+#include <dwrite.h>
 #include <wrl/client.h>
 
 #include <initguid.h>
@@ -37,6 +40,7 @@
 
 #include <iostream>
 #include <vector>
+#include <array>
 #include <string>
 #include <thread>
 #include <mutex>
@@ -54,6 +58,9 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "mf.lib")
@@ -66,6 +73,16 @@
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWA_BORDER_COLOR
+#define DWMWA_BORDER_COLOR 34
+#endif
 
 using Microsoft::WRL::ComPtr;
 
@@ -207,14 +224,22 @@ struct FileEndPayload {
 #pragma pack(pop)
 
 // ============================================================================
-// УТИЛИТЫ ВРЕМЕНИ, КРИПТОГРАФИИ И СЕТИ
+// УТИЛИТЫ ВРЕМЕНИ, КРИПТОГРАФИИ, СТИЛИЗАЦИИ И СЕТИ
 // ============================================================================
 static inline uint64_t NowMicros() {
     static LARGE_INTEGER freq = {};
-    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    static LARGE_INTEGER start = {};
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&start);
+    }
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
-    return static_cast<uint64_t>((counter.QuadPart * 1000000ULL) / freq.QuadPart);
+    LONGLONG delta = counter.QuadPart - start.QuadPart;
+    return static_cast<uint64_t>(
+        (delta / freq.QuadPart) * 1000000ULL +
+        ((delta % freq.QuadPart) * 1000000ULL) / freq.QuadPart
+    );
 }
 
 static inline void MicroSpinWait(uint64_t delayUs) {
@@ -231,6 +256,33 @@ static void DisableBackgroundPowerThrottling() {
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     timeBeginPeriod(1);
+}
+
+static void ApplyWindowDarkChrome(HWND hwnd, bool roundedCorners = false) {
+    if (!hwnd) return;
+    BOOL dark = TRUE;
+    if (FAILED(DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark)))) {
+        DwmSetWindowAttribute(hwnd, 19, &dark, sizeof(dark));
+    }
+    if (roundedCorners) {
+        DWORD pref = 2; // DWMWCP_ROUND
+        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
+        COLORREF borderCol = RGB(36, 48, 71);
+        DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &borderCol, sizeof(borderCol));
+    }
+}
+
+static void ApplyDarkScrollbarTheme(HWND hwnd) {
+    if (!hwnd) return;
+    static HMODULE hUxTheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (hUxTheme) {
+        using FnSetWindowTheme = HRESULT(WINAPI*)(HWND, LPCWSTR, LPCWSTR);
+        static auto pSetWindowTheme = reinterpret_cast<FnSetWindowTheme>(
+            GetProcAddress(hUxTheme, "SetWindowTheme"));
+        if (pSetWindowTheme) {
+            pSetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
+        }
+    }
 }
 
 class CryptoEngine {
@@ -268,6 +320,12 @@ public:
             BCryptCloseAlgorithmProvider(hAlg, 0);
         }
         return ok;
+    }
+
+    static bool ConstantTimeEqual32(const uint8_t a[32], const uint8_t b[32]) {
+        uint8_t diff = 0;
+        for (int i = 0; i < 32; ++i) diff |= (a[i] ^ b[i]);
+        return diff == 0;
     }
 
     static void StreamCrypt(uint8_t* data, size_t len, const uint8_t sessionKey[32], uint64_t counterNonce) {
@@ -381,8 +439,9 @@ public:
         m_activeTransferId = 0;
     }
 
-    bool OnFileStart(const FileStartPayload& start, std::wstring& outStatus) {
+    bool OnFileStart(const FileStartPayload& start, std::wstring& outStatus, float& outPct) {
         CloseActiveFile();
+        outPct = 0.0f;
         std::wstring rawName(start.fileName, wcsnlen(start.fileName, 259));
         size_t slashPos = rawName.find_last_of(L"\\/");
         if (slashPos != std::wstring::npos) rawName = rawName.substr(slashPos + 1);
@@ -409,7 +468,7 @@ public:
         return true;
     }
 
-    bool OnFileChunk(const FileChunkHeaderPayload& hdr, const uint8_t* data, std::wstring& outStatus, bool& notifyUi) {
+    bool OnFileChunk(const FileChunkHeaderPayload& hdr, const uint8_t* data, std::wstring& outStatus, float& outPct, bool& notifyUi) {
         notifyUi = false;
         if (m_hFile == INVALID_HANDLE_VALUE || hdr.transferId != m_activeTransferId) return false;
 
@@ -417,15 +476,17 @@ public:
         if (!WriteFile(m_hFile, data, hdr.chunkSize, &written, nullptr) || written != hdr.chunkSize) {
             CloseActiveFile();
             outStatus = L"Ошибка записи файла: " + m_fileName;
+            outPct = 0.0f;
             notifyUi = true;
             return false;
         }
 
         m_receivedBytes += written;
         uint64_t now = NowMicros();
-        if (now - m_lastUiUs > 150000ULL || m_receivedBytes == m_totalBytes) {
+        if (now - m_lastUiUs > 100000ULL || m_receivedBytes == m_totalBytes) {
             m_lastUiUs = now;
-            int pct = (m_totalBytes > 0) ? (int)((m_receivedBytes * 100ULL) / m_totalBytes) : 100;
+            outPct = (m_totalBytes > 0) ? std::clamp((float)m_receivedBytes / (float)m_totalBytes, 0.0f, 1.0f) : 1.0f;
+            int pct = (int)(outPct * 100.0f);
             std::wstringstream ss;
             ss << L"Приём: " << m_fileName << L" [" << pct << L"%, "
                << std::fixed << std::setprecision(1) << (m_receivedBytes / 1048576.0)
@@ -436,10 +497,11 @@ public:
         return true;
     }
 
-    void OnFileEnd(const FileEndPayload& end, std::wstring& outStatus) {
+    void OnFileEnd(const FileEndPayload& end, std::wstring& outStatus, float& outPct) {
         if (end.transferId == m_activeTransferId && m_hFile != INVALID_HANDLE_VALUE) {
             FlushFileBuffers(m_hFile);
             CloseActiveFile();
+            outPct = (end.status == 1) ? 1.0f : 0.0f;
             outStatus = (end.status == 1)
                 ? (L"Файл сохранён на Рабочий стол: " + m_fileName)
                 : (L"Передача файла прервана: " + m_fileName);
@@ -1561,43 +1623,400 @@ private:
 };
 
 // ============================================================================
-// ГЛОБАЛЬНОЕ ПРИЛОЖЕНИЕ, GUI И ПЕРЕДАЧА ФАЙЛОВ
+// ВЫСОКОТОЧНЫЙ QPC-ТАЙМЕР КАДРОВ (FRAME PACER) И DIRECT2D ДВОЙНОЙ БУФЕР
 // ============================================================================
+class UiFramePacer {
+public:
+    static constexpr size_t HISTORY_SIZE = 24;
+
+    void Initialize() {
+        RefreshTargetHz();
+        ResetTiming();
+    }
+
+    void RefreshTargetHz() {
+        DEVMODEW dm = {};
+        dm.dmSize = sizeof(dm);
+        uint32_t hz = 60;
+        if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) &&
+            dm.dmDisplayFrequency >= 30 && dm.dmDisplayFrequency <= 360) {
+            hz = dm.dmDisplayFrequency;
+        }
+        m_targetHz = hz;
+        m_targetFrameUs = 1000000ULL / hz;
+    }
+
+    void ResetTiming() {
+        uint64_t now = NowMicros();
+        m_lastFrameUs = now;
+        m_nextTargetUs = now;
+        m_statsWindowStartUs = now;
+        m_framesInWindow = 0;
+    }
+
+    bool WaitOrCheckFrameReady(bool animateActive, float& outDtSec) {
+        outDtSec = 0.0f;
+        if (!animateActive) {
+            MsgWaitForMultipleObjectsEx(0, nullptr, 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            ResetTiming();
+            return false;
+        }
+
+        uint64_t now = NowMicros();
+        if (m_nextTargetUs == 0) {
+            m_nextTargetUs = now;
+            m_lastFrameUs = now;
+            m_statsWindowStartUs = now;
+        }
+
+        if (now < m_nextTargetUs) {
+            uint64_t remUs = m_nextTargetUs - now;
+            if (remUs > 1800ULL) {
+                DWORD waitMs = (DWORD)((remUs - 1200ULL) / 1000ULL);
+                MsgWaitForMultipleObjectsEx(0, nullptr, waitMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                return false;
+            }
+            while (NowMicros() < m_nextTargetUs) {
+                MSG peek = {};
+                if (PeekMessageW(&peek, nullptr, 0, 0, PM_NOREMOVE)) return false;
+                YieldProcessor();
+            }
+            now = NowMicros();
+        }
+
+        uint64_t dtUs = (m_lastFrameUs > 0 && now > m_lastFrameUs) ? (now - m_lastFrameUs) : m_targetFrameUs;
+        outDtSec = std::clamp((float)dtUs / 1000000.0f, 0.0005f, 0.08f);
+        m_lastFrameUs = now;
+
+        m_nextTargetUs += m_targetFrameUs;
+        if (now > m_nextTargetUs + m_targetFrameUs * 2) {
+            m_nextTargetUs = now + m_targetFrameUs;
+        }
+
+        m_frameHistoryMs[m_historyCursor] = (float)dtUs / 1000.0f;
+        m_historyCursor = (m_historyCursor + 1) % HISTORY_SIZE;
+
+        m_framesInWindow++;
+        uint64_t windowElapsedUs = now - m_statsWindowStartUs;
+        if (windowElapsedUs >= 220000ULL && m_framesInWindow > 0) {
+            m_displayFps = (float)((double)m_framesInWindow * 1000000.0 / (double)windowElapsedUs);
+            m_displayFrameMs = (float)(((double)windowElapsedUs / 1000.0) / (double)m_framesInWindow);
+            m_framesInWindow = 0;
+            m_statsWindowStartUs = now;
+        }
+        return true;
+    }
+
+    float    GetDisplayFps() const { return m_displayFps; }
+    float    GetDisplayFrameMs() const { return m_displayFrameMs; }
+    uint32_t GetTargetHz() const { return m_targetHz; }
+    const std::array<float, HISTORY_SIZE>& GetHistoryMs() const { return m_frameHistoryMs; }
+    size_t   GetHistoryCursor() const { return m_historyCursor; }
+
+private:
+    uint32_t m_targetHz = 60;
+    uint64_t m_targetFrameUs = 16666;
+    uint64_t m_lastFrameUs = 0;
+    uint64_t m_nextTargetUs = 0;
+    uint64_t m_statsWindowStartUs = 0;
+    uint32_t m_framesInWindow = 0;
+    float    m_displayFps = 60.0f;
+    float    m_displayFrameMs = 16.67f;
+    std::array<float, HISTORY_SIZE> m_frameHistoryMs = {};
+    size_t   m_historyCursor = 0;
+};
+
+static inline D2D1_COLOR_F HexColor(uint32_t rgb, float alpha = 1.0f) {
+    return D2D1::ColorF(
+        ((rgb >> 16) & 0xFF) / 255.0f,
+        ((rgb >> 8)  & 0xFF) / 255.0f,
+        (rgb & 0xFF)         / 255.0f,
+        alpha
+    );
+}
+
+static inline D2D1_COLOR_F LerpColor(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b, float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return D2D1::ColorF(
+        a.r + (b.r - a.r) * t,
+        a.g + (b.g - a.g) * t,
+        a.b + (b.b - a.b) * t,
+        a.a + (b.a - a.a) * t
+    );
+}
+
+static inline float SmoothApproach(float current, float target, float speed, float dt) {
+    float alpha = 1.0f - std::exp(-speed * dt);
+    float next = current + (target - current) * alpha;
+    if (std::fabs(next - target) < 0.001f) return target;
+    return next;
+}
+
+class D2DOffscreenTarget {
+public:
+    ~D2DOffscreenTarget() { Destroy(); }
+
+    bool BeginFrame(HWND hwnd, uint32_t width, uint32_t height, ID2D1DCRenderTarget** outRt) {
+        if (width == 0 || height == 0) return false;
+        if (!EnsureResources(hwnd, width, height)) return false;
+
+        RECT rc = { 0, 0, (LONG)width, (LONG)height };
+        if (FAILED(m_dcTarget->BindDC(m_memDC, &rc))) {
+            ResetTarget();
+            return false;
+        }
+        m_dcTarget->BeginDraw();
+        *outRt = m_dcTarget.Get();
+        return true;
+    }
+
+    void EndFrameAndBlit(HDC targetDC, uint32_t width, uint32_t height) {
+        if (!m_dcTarget) return;
+        HRESULT hr = m_dcTarget->EndDraw();
+        if (hr == D2DERR_RECREATE_TARGET) {
+            ResetTarget();
+            return;
+        }
+        BitBlt(targetDC, 0, 0, (int)width, (int)height, m_memDC, 0, 0, SRCCOPY);
+    }
+
+    ID2D1SolidColorBrush* Brush(const D2D1_COLOR_F& col) {
+        if (!m_brush && m_dcTarget) {
+            m_dcTarget->CreateSolidColorBrush(col, &m_brush);
+        } else if (m_brush) {
+            m_brush->SetColor(col);
+        }
+        return m_brush.Get();
+    }
+
+    void DrawTextBox(const std::wstring& text, IDWriteTextFormat* fmt, const D2D1_RECT_F& rect, const D2D1_COLOR_F& col) {
+        if (!m_dcTarget || !m_dwriteFactory || !fmt || text.empty()) return;
+        float w = std::max(1.0f, rect.right - rect.left);
+        float h = std::max(1.0f, rect.bottom - rect.top);
+        ComPtr<IDWriteTextLayout> layout;
+        if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(text.c_str(), (UINT32)text.size(), fmt, w, h, &layout))) {
+            m_dcTarget->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), layout.Get(), Brush(col), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+    }
+
+    void UpdateFontsForDpi(UINT dpi) {
+        if (!m_dwriteFactory) {
+            DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                reinterpret_cast<IUnknown**>(m_dwriteFactory.GetAddressOf()));
+        }
+        if (!m_dwriteFactory || (m_fontDpi == dpi && m_fmtTitle)) return;
+        m_fontDpi = dpi;
+
+        auto MakeFmt = [&](const wchar_t* family, float pt96, DWRITE_FONT_WEIGHT weight,
+                           DWRITE_TEXT_ALIGNMENT hAlign, DWRITE_PARAGRAPH_ALIGNMENT vAlign,
+                           bool ellipsis, ComPtr<IDWriteTextFormat>& outFmt) {
+            outFmt.Reset();
+            float px = pt96 * ((float)dpi / 96.0f);
+            if (SUCCEEDED(m_dwriteFactory->CreateTextFormat(
+                    family, nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                    px, L"ru-RU", &outFmt))) {
+                outFmt->SetTextAlignment(hAlign);
+                outFmt->SetParagraphAlignment(vAlign);
+                if (ellipsis) {
+                    ComPtr<IDWriteInlineObject> trimSign;
+                    if (SUCCEEDED(m_dwriteFactory->CreateEllipsisTrimmingSign(outFmt.Get(), &trimSign))) {
+                        DWRITE_TRIMMING trim = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+                        outFmt->SetTrimming(&trim, trimSign.Get());
+                    }
+                }
+            }
+        };
+
+        MakeFmt(L"Segoe UI", 16.0f, DWRITE_FONT_WEIGHT_BOLD,      DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true,  m_fmtTitle);
+        MakeFmt(L"Segoe UI", 13.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true,  m_fmtCardTitle);
+        MakeFmt(L"Segoe UI", 12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,   DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true,  m_fmtButton);
+        MakeFmt(L"Segoe UI", 11.8f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true,  m_fmtLabel);
+        MakeFmt(L"Segoe UI", 11.2f, DWRITE_FONT_WEIGHT_NORMAL,    DWRITE_TEXT_ALIGNMENT_LEADING,  DWRITE_PARAGRAPH_ALIGNMENT_NEAR,   false, m_fmtBody);
+        MakeFmt(L"Segoe UI", 10.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,   DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true,  m_fmtBadge);
+        MakeFmt(L"Consolas", 11.2f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,   DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true,  m_fmtMono);
+    }
+
+    void Destroy() {
+        ResetTarget();
+        DestroyDib();
+        m_fmtTitle.Reset(); m_fmtCardTitle.Reset(); m_fmtButton.Reset();
+        m_fmtLabel.Reset(); m_fmtBody.Reset(); m_fmtBadge.Reset(); m_fmtMono.Reset();
+        m_dwriteFactory.Reset();
+        m_d2dFactory.Reset();
+    }
+
+    IDWriteTextFormat* FmtTitle()     const { return m_fmtTitle.Get(); }
+    IDWriteTextFormat* FmtCardTitle() const { return m_fmtCardTitle.Get(); }
+    IDWriteTextFormat* FmtButton()    const { return m_fmtButton.Get(); }
+    IDWriteTextFormat* FmtLabel()     const { return m_fmtLabel.Get(); }
+    IDWriteTextFormat* FmtBody()      const { return m_fmtBody.Get(); }
+    IDWriteTextFormat* FmtBadge()     const { return m_fmtBadge.Get(); }
+    IDWriteTextFormat* FmtMono()      const { return m_fmtMono.Get(); }
+
+private:
+    bool EnsureResources(HWND hwnd, uint32_t width, uint32_t height) {
+        if (!m_d2dFactory) {
+            if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory),
+                                         nullptr, reinterpret_cast<void**>(m_d2dFactory.GetAddressOf()))))
+                return false;
+        }
+        if (!m_dwriteFactory) {
+            if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                           reinterpret_cast<IUnknown**>(m_dwriteFactory.GetAddressOf()))))
+                return false;
+        }
+        UpdateFontsForDpi(GetDpiForWindow(hwnd));
+
+        if (!m_dcTarget) {
+            D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+                D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f,
+                D2D1_RENDER_TARGET_USAGE_NONE,
+                D2D1_FEATURE_LEVEL_DEFAULT
+            );
+            if (FAILED(m_d2dFactory->CreateDCRenderTarget(&props, &m_dcTarget)))
+                return false;
+            m_dcTarget->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        }
+
+        if (!m_memDC || !m_dib || m_width != width || m_height != height) {
+            DestroyDib();
+            HDC screenDC = GetDC(hwnd);
+            m_memDC = CreateCompatibleDC(screenDC);
+            ReleaseDC(hwnd, screenDC);
+            if (!m_memDC) return false;
+
+            BITMAPINFO bmi = {};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = (LONG)width;
+            bmi.bmiHeader.biHeight = -(LONG)height;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+
+            void* bits = nullptr;
+            m_dib = CreateDIBSection(m_memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (!m_dib) {
+                DeleteDC(m_memDC);
+                m_memDC = nullptr;
+                return false;
+            }
+            m_oldBmp = SelectObject(m_memDC, m_dib);
+            m_width = width;
+            m_height = height;
+        }
+        return true;
+    }
+
+    void ResetTarget() {
+        m_brush.Reset();
+        m_dcTarget.Reset();
+    }
+
+    void DestroyDib() {
+        if (m_memDC) {
+            if (m_oldBmp) SelectObject(m_memDC, m_oldBmp);
+            DeleteDC(m_memDC);
+            m_memDC = nullptr;
+            m_oldBmp = nullptr;
+        }
+        if (m_dib) {
+            DeleteObject(m_dib);
+            m_dib = nullptr;
+        }
+        m_width = 0;
+        m_height = 0;
+    }
+
+    ComPtr<ID2D1Factory>          m_d2dFactory;
+    ComPtr<IDWriteFactory>        m_dwriteFactory;
+    ComPtr<ID2D1DCRenderTarget>   m_dcTarget;
+    ComPtr<ID2D1SolidColorBrush>  m_brush;
+    ComPtr<IDWriteTextFormat>     m_fmtTitle, m_fmtCardTitle, m_fmtButton, m_fmtLabel, m_fmtBody, m_fmtBadge, m_fmtMono;
+    HDC     m_memDC = nullptr;
+    HBITMAP m_dib = nullptr;
+    HGDIOBJ m_oldBmp = nullptr;
+    uint32_t m_width = 0, m_height = 0;
+    UINT     m_fontDpi = 0;
+};
+
+// ============================================================================
+// МОДЕЛЬ КНОПОК, ПОЛЕЙ И МОДАЛЬНЫХ ОКОН В ТЁМНОЙ ТЕМЕ
+// ============================================================================
+enum ButtonVariant : uint8_t {
+    BTN_VAR_SECONDARY = 0,
+    BTN_VAR_PRIMARY_BLUE,
+    BTN_VAR_PRIMARY_GREEN,
+    BTN_VAR_DANGER,
+    BTN_VAR_GHOST
+};
+
+struct CanvasButton {
+    int           id = 0;
+    D2D1_RECT_F   rect = {};
+    std::wstring  text;
+    ButtonVariant variant = BTN_VAR_SECONDARY;
+    bool          enabled = true;
+    float         hoverT = 0.0f;
+    float         pressT = 0.0f;
+};
+
+struct CanvasToggle {
+    D2D1_RECT_F  hitRect = {};
+    D2D1_RECT_F  trackRect = {};
+    std::wstring label;
+    bool         checked = false;
+    float        hoverT = 0.0f;
+    float        knobT = 0.0f;
+};
+
+struct InputFrameBox {
+    HWND        hwnd = nullptr;
+    D2D1_RECT_F rect = {};
+    std::wstring label;
+    D2D1_RECT_F labelRect = {};
+    float       focusT = 0.0f;
+    bool        isReadOnly = false;
+};
+
+enum class ModalPinMode {
+    SetHostSessionPin,
+    ConfirmExitHostSession
+};
+
 enum GuiControlIds : int {
-    IDC_GRP_SERVER       = 100,
-    IDC_LBL_SRV_NAME     = 101,
     IDC_EDIT_SRV_NAME    = 102,
-    IDC_LBL_SRV_PASS     = 103,
     IDC_EDIT_SRV_PASS    = 104,
-    IDC_LBL_SRV_PORT     = 105,
     IDC_EDIT_SRV_PORT    = 106,
-    IDC_CHK_AUTO_MIN     = 107,
     IDC_BTN_SRV_TOGGLE   = 108,
     IDC_BTN_SRV_TRAY     = 109,
     IDC_BTN_SRV_SENDFILE = 110,
-    IDC_LBL_SRV_STATUS   = 111,
+    IDC_TOGGLE_AUTO_MIN  = 112,
 
-    IDC_GRP_CLIENT       = 200,
     IDC_BTN_CLI_SCAN     = 201,
     IDC_LIST_HOSTS       = 202,
-    IDC_LBL_CLI_IP       = 203,
     IDC_EDIT_CLI_IP      = 204,
     IDC_EDIT_CLI_PORT    = 205,
-    IDC_LBL_CLI_PASS     = 206,
     IDC_EDIT_CLI_PASS    = 207,
     IDC_BTN_CLI_CONNECT  = 208,
     IDC_BTN_CLI_SENDFILE = 209,
-    IDC_LBL_CLI_STATUS   = 210,
 
     IDM_TRAY_RESTORE     = 301,
     IDM_TRAY_STOP_SRV    = 302,
-    IDM_TRAY_EXIT        = 303
+    IDM_TRAY_EXIT        = 303,
+
+    IDC_MODAL_EDIT_PIN   = 401,
+    IDC_MODAL_BTN_OK     = 402,
+    IDC_MODAL_BTN_CANCEL = 403,
+    IDC_MODAL_BTN_EYE    = 404
 };
 
-static constexpr UINT WM_APP_UPDATE_UI   = WM_APP + 10;
-static constexpr UINT WM_APP_HOST_FOUND  = WM_APP + 11;
-static constexpr UINT WM_APP_CLIENT_LOST = WM_APP + 12;
-static constexpr UINT WM_APP_TRAY_ICON   = WM_APP + 13;
+static constexpr UINT WM_APP_UPDATE_UI     = WM_APP + 10;
+static constexpr UINT WM_APP_HOST_FOUND    = WM_APP + 11;
+static constexpr UINT WM_APP_CLIENT_LOST   = WM_APP + 12;
+static constexpr UINT WM_APP_TRAY_ICON     = WM_APP + 13;
+static constexpr UINT WM_APP_AUTO_MINIMIZE = WM_APP + 14;
 
 struct DiscoveredHostInfo {
     std::string name, ip;
@@ -1609,28 +2028,72 @@ class RemoteDesktopApp {
 public:
     HWND  m_hwndMain = nullptr;
     HWND  m_hwndViewer = nullptr;
-    HFONT m_hFont = nullptr;
-    HFONT m_hFontBold = nullptr;
+    HFONT m_hEditFont = nullptr;
+    HFONT m_hListFont = nullptr;
+    HFONT m_hListFontBold = nullptr;
+    HBRUSH m_hDarkInputBrush = nullptr;
+    HBRUSH m_hDarkListBrush  = nullptr;
     HHOOK m_hKeyboardHook = nullptr;
     bool  m_trayAdded = false;
 
-    // Контролы Сервера
-    HWND m_grpServer = nullptr, m_lblSrvName = nullptr, m_editSrvName = nullptr;
-    HWND m_lblSrvPass = nullptr, m_editSrvPass = nullptr, m_lblSrvPort = nullptr, m_editSrvPort = nullptr;
-    HWND m_chkAutoMin = nullptr, m_btnSrvToggle = nullptr, m_btnSrvTray = nullptr;
-    HWND m_btnSrvSendFile = nullptr, m_lblSrvStatus = nullptr;
+    // Редактируемые Win32-контролы (внутри кастомных рамок Direct2D)
+    HWND m_editSrvName = nullptr, m_editSrvPass = nullptr, m_editSrvPort = nullptr;
+    HWND m_listHosts   = nullptr;
+    HWND m_editCliIp   = nullptr, m_editCliPort = nullptr, m_editCliPass = nullptr;
 
-    // Контролы Клиента
-    HWND m_grpClient = nullptr, m_btnCliScan = nullptr, m_listHosts = nullptr;
-    HWND m_lblCliIp = nullptr, m_editCliIp = nullptr, m_editCliPort = nullptr;
-    HWND m_lblCliPass = nullptr, m_editCliPass = nullptr, m_btnCliConnect = nullptr;
-    HWND m_btnCliSendFile = nullptr, m_lblCliStatus = nullptr;
+    // Рендеринг и pacer главного меню
+    UiFramePacer       m_framePacer;
+    D2DOffscreenTarget m_mainCanvas;
+    float              m_pulsePhase = 0.0f;
+    float              m_srvCardGlow = 0.0f;
+    float              m_cliCardGlow = 0.0f;
+    float              m_listFocusT  = 0.0f;
+    D2D1_RECT_F        m_srvCardRect = {};
+    D2D1_RECT_F        m_cliCardRect = {};
+    D2D1_RECT_F        m_listFrameRect = {};
+    D2D1_RECT_F        m_srvStatusBoxRect = {};
+    D2D1_RECT_F        m_cliStatusBoxRect = {};
+    D2D1_RECT_F        m_headerRect = {};
+    std::array<InputFrameBox, 6> m_inputFrames;
+    std::array<CanvasButton, 6>  m_buttons;
+    CanvasToggle       m_autoMinToggle;
+    int                m_hoveredBtnId = -1;
+    int                m_pressedBtnId = -1;
+    bool               m_hoveredToggle = false;
+    bool               m_pressedToggle = false;
+    bool               m_trackingMouse = false;
+
+    // Состояние модального диалога PIN-кода сессии
+    struct PinModalState {
+        bool               active = false;
+        ModalPinMode       mode = ModalPinMode::SetHostSessionPin;
+        HWND               hwnd = nullptr;
+        HWND               hwndEdit = nullptr;
+        D2DOffscreenTarget canvas;
+        std::wstring       errorText;
+        float              shakeTimer = 0.0f;
+        bool               showPassword = false;
+        bool               confirmed = false;
+        bool               trackingMouse = false;
+        int                hoveredBtnId = -1;
+        int                pressedBtnId = -1;
+        D2D1_RECT_F        editFrameRect = {};
+        std::array<CanvasButton, 3> buttons; // OK, Cancel, Show/Hide
+    } m_modal;
+
+    // Runtime PIN-код текущей хост-сессии (хранится ТОЛЬКО в памяти в виде солёного SHA-256)
+    std::mutex m_pinMutex;
+    bool       m_hasSessionPin = false;
+    uint8_t    m_sessionPinSalt[32] = {};
+    uint8_t    m_sessionPinHash[32] = {};
 
     // Состояние Сервера
     std::atomic<bool>     m_serverRunning{ false };
     std::atomic<bool>     m_clientAuthorized{ false };
+    std::atomic<bool>     m_autoMinimize{ false };
     std::atomic<bool>     m_forceIdrNextFrame{ true };
     std::atomic<uint32_t> m_srvFps{ 0 }, m_srvEncodeUs{ 0 }, m_srvClientDecodeUs{ 0 }, m_srvRttUs{ 0 };
+    std::mutex            m_srvInfoMutex;
     std::string           m_radminIp, m_connectedClientIp;
     uint16_t              m_serverPort = DEFAULT_STREAM_PORT;
 
@@ -1645,6 +2108,8 @@ public:
 
     // Состояние Клиента
     std::atomic<bool>     m_clientRunning{ false };
+    std::atomic<bool>     m_viewerVisible{ false };
+    std::atomic<bool>     m_scanInProgress{ false };
     std::atomic<uint32_t> m_cliFps{ 0 }, m_cliEncodeUs{ 0 }, m_cliDecodeUs{ 0 }, m_cliRttUs{ 0 };
     SOCKET                m_cliTcpSock = INVALID_SOCKET, m_cliUdpSock = INVALID_SOCKET;
     std::mutex            m_cliTcpSendMutex;
@@ -1658,24 +2123,95 @@ public:
     std::atomic<bool>     m_srvSendingFile{ false };
     std::atomic<bool>     m_cliSendingFile{ false };
     std::mutex            m_fileStatusMutex;
-    std::wstring          m_srvFileStatus = L"Файлы: готово к передаче (сохранение на Рабочий стол)";
-    std::wstring          m_cliFileStatus = L"Файлы: готово к передаче (сохранение на Рабочий стол)";
+    std::wstring          m_srvFileStatus = L"Файлы: готово (сохранение на Рабочий стол)";
+    std::wstring          m_cliFileStatus = L"Файлы: готово (сохранение на Рабочий стол)";
+    float                 m_srvFilePct = 0.0f;
+    float                 m_cliFilePct = 0.0f;
 
     std::mutex                      m_hostsMutex;
     std::vector<DiscoveredHostInfo> m_discoveredHosts;
     bool m_isViewerFullscreen = false;
     WINDOWPLACEMENT m_viewerPrevPlacement = { sizeof(WINDOWPLACEMENT) };
 
-    void SetFileStatus(bool forServer, const std::wstring& text) {
-        {
-            std::lock_guard<std::mutex> lock(m_fileStatusMutex);
-            if (forServer) m_srvFileStatus = text;
-            else           m_cliFileStatus = text;
-        }
-        PostMessageW(m_hwndMain, WM_APP_UPDATE_UI, 0, 0);
+    // ========================================================================
+    // УПРАВЛЕНИЕ ДИНАМИЧЕСКИМ PIN-КОДОМ СЕССИИ
+    // ========================================================================
+    bool SetRuntimeSessionPin(const wchar_t* pinChars, size_t charCount) {
+        if (!pinChars || charCount == 0) return false;
+        uint8_t salt[32] = {};
+        if (!CryptoEngine::RandomBytes(salt, sizeof(salt))) return false;
+
+        std::vector<uint8_t> material(charCount * sizeof(wchar_t) + sizeof(salt));
+        memcpy(material.data(), pinChars, charCount * sizeof(wchar_t));
+        memcpy(material.data() + charCount * sizeof(wchar_t), salt, sizeof(salt));
+
+        uint8_t digest[32] = {};
+        bool ok = CryptoEngine::ComputeSHA256(material.data(), material.size(), digest);
+        SecureZeroMemory(material.data(), material.size());
+        if (!ok) return false;
+
+        std::lock_guard<std::mutex> lock(m_pinMutex);
+        memcpy(m_sessionPinSalt, salt, sizeof(salt));
+        memcpy(m_sessionPinHash, digest, sizeof(digest));
+        m_hasSessionPin = true;
+        SecureZeroMemory(salt, sizeof(salt));
+        SecureZeroMemory(digest, sizeof(digest));
+        return true;
     }
 
-    // Диалог выбора файла и запуск асинхронной отправки
+    bool VerifyRuntimeSessionPin(const wchar_t* pinChars, size_t charCount) {
+        if (!pinChars || charCount == 0) return false;
+        uint8_t saltCopy[32] = {}, expectedCopy[32] = {};
+        {
+            std::lock_guard<std::mutex> lock(m_pinMutex);
+            if (!m_hasSessionPin) return false;
+            memcpy(saltCopy, m_sessionPinSalt, 32);
+            memcpy(expectedCopy, m_sessionPinHash, 32);
+        }
+
+        std::vector<uint8_t> material(charCount * sizeof(wchar_t) + sizeof(saltCopy));
+        memcpy(material.data(), pinChars, charCount * sizeof(wchar_t));
+        memcpy(material.data() + charCount * sizeof(wchar_t), saltCopy, sizeof(saltCopy));
+
+        uint8_t actual[32] = {};
+        bool ok = CryptoEngine::ComputeSHA256(material.data(), material.size(), actual);
+        bool match = ok && CryptoEngine::ConstantTimeEqual32(actual, expectedCopy);
+
+        SecureZeroMemory(material.data(), material.size());
+        SecureZeroMemory(actual, sizeof(actual));
+        SecureZeroMemory(saltCopy, sizeof(saltCopy));
+        SecureZeroMemory(expectedCopy, sizeof(expectedCopy));
+        return match;
+    }
+
+    void ClearRuntimeSessionPin() {
+        std::lock_guard<std::mutex> lock(m_pinMutex);
+        m_hasSessionPin = false;
+        SecureZeroMemory(m_sessionPinSalt, sizeof(m_sessionPinSalt));
+        SecureZeroMemory(m_sessionPinHash, sizeof(m_sessionPinHash));
+    }
+
+    // Объявления методов реализации модального окна и главного цикла отрисовки
+    bool RunPinModalDialog(ModalPinMode mode);
+    void HandleCloseRequest();
+    void TickAndRenderUi(float dt);
+    void PaintMainWindow(HWND hwnd);
+    void PaintModalWindow(HWND hwnd);
+
+    void SetFileStatus(bool forServer, const std::wstring& text, float pct = -1.0f) {
+        {
+            std::lock_guard<std::mutex> lock(m_fileStatusMutex);
+            if (forServer) {
+                m_srvFileStatus = text;
+                if (pct >= 0.0f) m_srvFilePct = pct;
+            } else {
+                m_cliFileStatus = text;
+                if (pct >= 0.0f) m_cliFilePct = pct;
+            }
+        }
+        if (m_hwndMain) PostMessageW(m_hwndMain, WM_APP_UPDATE_UI, 0, 0);
+    }
+
     void PromptAndSendFile(bool fromServer) {
         if (fromServer) {
             if (!m_serverRunning || !m_clientAuthorized || m_srvClientTcp == INVALID_SOCKET) {
@@ -1722,7 +2258,7 @@ public:
             HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (hFile == INVALID_HANDLE_VALUE) {
-                SetFileStatus(fromServer, L"Ошибка открытия файла для отправки!");
+                SetFileStatus(fromServer, L"Ошибка открытия файла для отправки!", 0.0f);
                 if (fromServer) m_srvSendingFile = false; else m_cliSendingFile = false;
                 return;
             }
@@ -1742,7 +2278,6 @@ public:
             std::mutex& mtxRef = fromServer ? m_srvTcpSendMutex : m_cliTcpSendMutex;
             const uint8_t* keyPtr = fromServer ? m_srvSessionKey : m_cliSessionKey;
 
-            // 1. Пакет начала файла (CTRL_FILE_START)
             FileStartPayload startPkt = {};
             startPkt.transferId = transferId;
             startPkt.totalSize = totalSize;
@@ -1759,9 +2294,8 @@ public:
                          SendAllTcp(sockRef, &encStart, sizeof(encStart));
             }
 
-            SetFileStatus(fromServer, L"Отправка: " + baseName + L" (0%)");
+            SetFileStatus(fromServer, L"Отправка: " + baseName + L" (0%)", 0.0f);
 
-            // 2. Потоковая передача чанками по 64 КБ (CTRL_FILE_CHUNK)
             std::vector<uint8_t> chunkBuf(sizeof(FileChunkHeaderPayload) + FILE_CHUNK_SIZE);
             uint64_t sentBytes = 0;
             uint64_t lastUiUs = 0;
@@ -1795,20 +2329,20 @@ public:
 
                 sentBytes += bytesRead;
                 uint64_t now = NowMicros();
-                if (now - lastUiUs > 150000ULL || sentBytes == totalSize) {
+                if (now - lastUiUs > 100000ULL || sentBytes == totalSize) {
                     lastUiUs = now;
-                    int pct = (totalSize > 0) ? (int)((sentBytes * 100ULL) / totalSize) : 100;
+                    float frac = (totalSize > 0) ? std::clamp((float)sentBytes / (float)totalSize, 0.0f, 1.0f) : 1.0f;
+                    int pct = (int)(frac * 100.0f);
                     std::wstringstream ss;
                     ss << L"Отправка: " << baseName << L" [" << pct << L"%, "
                        << std::fixed << std::setprecision(1) << (sentBytes / 1048576.0)
                        << L" / " << (totalSize / 1048576.0) << L" МБ]";
-                    SetFileStatus(fromServer, ss.str());
+                    SetFileStatus(fromServer, ss.str(), frac);
                 }
             }
 
             CloseHandle(hFile);
 
-            // 3. Пакет завершения (CTRL_FILE_END)
             if (sockRef != INVALID_SOCKET) {
                 FileEndPayload endPkt = { transferId, (uint8_t)(sendOk ? 1 : 0) };
                 ControlHeader endHdr = { MAGIC_CONTROL, CTRL_FILE_END, sizeof(endPkt) };
@@ -1817,9 +2351,9 @@ public:
                 SendAllTcp(sockRef, &endPkt, sizeof(endPkt));
             }
 
-            SetFileStatus(fromServer, sendOk
-                ? (L"Файл успешно отправлен: " + baseName)
-                : (L"Ошибка при отправке файла: " + baseName));
+            SetFileStatus(fromServer,
+                sendOk ? (L"Файл успешно отправлен: " + baseName) : (L"Ошибка при отправке файла: " + baseName),
+                sendOk ? 1.0f : 0.0f);
 
             if (fromServer) m_srvSendingFile = false;
             else            m_cliSendingFile = false;
@@ -1837,17 +2371,31 @@ public:
             nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             nid.uCallbackMessage = WM_APP_TRAY_ICON;
             nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-            wcscpy_s(nid.szTip, L"Radmin Ultra RD (Фоновый режим активен)");
+            wcscpy_s(nid.szTip, L"Radmin Ultra RD");
             Shell_NotifyIconW(NIM_ADD, &nid);
             m_trayAdded = true;
         }
+        UpdateTrayTooltip();
         if (hideWindow) ShowWindow(m_hwndMain, SW_HIDE);
+    }
+
+    void UpdateTrayTooltip() {
+        if (!m_trayAdded) return;
+        NOTIFYICONDATAW nid = { sizeof(NOTIFYICONDATAW) };
+        nid.hWnd = m_hwndMain;
+        nid.uID = 1;
+        nid.uFlags = NIF_TIP;
+        wcscpy_s(nid.szTip, m_serverRunning
+            ? L"Radmin Ultra RD (Хост активен · защищено PIN-кодом)"
+            : L"Radmin Ultra RD (Ожидание)");
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 
     void RestoreFromTray() {
         ShowWindow(m_hwndMain, SW_RESTORE);
         ShowWindow(m_hwndMain, SW_SHOW);
         SetForegroundWindow(m_hwndMain);
+        m_framePacer.ResetTiming();
     }
 
     void RemoveTrayIcon() {
@@ -1863,7 +2411,16 @@ public:
     // ========================================================================
     // СЕРВЕРНАЯ ЛОГИКА
     // ========================================================================
-    void StartServer() {
+    void StartServerWithPinPrompt() {
+        if (m_serverRunning) return;
+        if (!RunPinModalDialog(ModalPinMode::SetHostSessionPin)) {
+            ClearRuntimeSessionPin();
+            return;
+        }
+        StartServerInternal();
+    }
+
+    void StartServerInternal() {
         if (m_serverRunning) return;
 
         char nameBuf[64] = {}, passBuf[128] = {}, portBuf[16] = {};
@@ -1873,7 +2430,10 @@ public:
 
         m_serverPort = (uint16_t)std::atoi(portBuf);
         if (m_serverPort == 0) m_serverPort = DEFAULT_STREAM_PORT;
-        m_radminIp = DetectRadminVpnIP();
+        {
+            std::lock_guard<std::mutex> lock(m_srvInfoMutex);
+            m_radminIp = DetectRadminVpnIP();
+        }
 
         m_srvListenTcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         BOOL reuse = TRUE;
@@ -1888,6 +2448,7 @@ public:
             listen(m_srvListenTcp, 1) == SOCKET_ERROR) {
             closesocket(m_srvListenTcp);
             m_srvListenTcp = INVALID_SOCKET;
+            ClearRuntimeSessionPin();
             MessageBoxW(m_hwndMain, L"Не удалось занять порт сервера!", L"Ошибка", MB_ICONERROR);
             return;
         }
@@ -1909,23 +2470,31 @@ public:
         bind(m_srvDiscUdp, (sockaddr*)&discAddr, sizeof(discAddr));
 
         m_serverRunning = true;
-        SetWindowTextW(m_btnSrvToggle, L"Остановить сервер");
+        if (IsWindow(m_editSrvName)) SendMessageW(m_editSrvName, EM_SETREADONLY, TRUE, 0);
+        if (IsWindow(m_editSrvPass)) SendMessageW(m_editSrvPass, EM_SETREADONLY, TRUE, 0);
+        if (IsWindow(m_editSrvPort)) SendMessageW(m_editSrvPort, EM_SETREADONLY, TRUE, 0);
+        UpdateTrayTooltip();
 
         std::string serverName = nameBuf[0] ? nameBuf : "Radmin-Host";
         std::string serverPass = passBuf;
+        SecureZeroMemory(passBuf, sizeof(passBuf));
 
         m_srvDiscoveryThread = std::thread(&RemoteDesktopApp::ServerDiscoveryLoop, this, serverName);
         m_srvAcceptThread    = std::thread(&RemoteDesktopApp::ServerAcceptAndControlLoop, this, serverPass);
         m_srvCaptureThread   = std::thread(&RemoteDesktopApp::ServerCaptureAndEncodeLoop, this);
+        SecureZeroMemory(serverPass.data(), serverPass.size());
 
-        UpdateStatusLabels();
-        if (SendMessageW(m_chkAutoMin, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        RefreshButtonVisualStates();
+        if (m_autoMinimize.load()) {
             ShowWindow(m_hwndMain, SW_MINIMIZE);
         }
     }
 
     void StopServer() {
-        if (!m_serverRunning.exchange(false)) return;
+        if (!m_serverRunning.exchange(false)) {
+            ClearRuntimeSessionPin();
+            return;
+        }
         m_clientAuthorized = false;
 
         if (m_srvListenTcp != INVALID_SOCKET) { closesocket(m_srvListenTcp); m_srvListenTcp = INVALID_SOCKET; }
@@ -1938,9 +2507,21 @@ public:
         if (m_srvCaptureThread.joinable())   m_srvCaptureThread.join();
 
         m_inputAndClip.ReleaseAllHeldKeys();
-        m_connectedClientIp.clear();
-        SetWindowTextW(m_btnSrvToggle, L"Запустить сервер");
-        UpdateStatusLabels();
+        {
+            std::lock_guard<std::mutex> lock(m_srvInfoMutex);
+            m_connectedClientIp.clear();
+        }
+        m_srvFps = 0;
+        m_srvEncodeUs = 0;
+        m_srvClientDecodeUs = 0;
+        m_srvRttUs = 0;
+        ClearRuntimeSessionPin();
+
+        if (IsWindow(m_editSrvName)) SendMessageW(m_editSrvName, EM_SETREADONLY, FALSE, 0);
+        if (IsWindow(m_editSrvPass)) SendMessageW(m_editSrvPass, EM_SETREADONLY, FALSE, 0);
+        if (IsWindow(m_editSrvPort)) SendMessageW(m_editSrvPort, EM_SETREADONLY, FALSE, 0);
+        UpdateTrayTooltip();
+        RefreshButtonVisualStates();
     }
 
     void ServerDiscoveryLoop(std::string serverName) {
@@ -2020,20 +2601,25 @@ public:
             CryptoEngine::ComputeSHA256(pwdSalt.data(), pwdSalt.size(), pwdHash);
             CryptoEngine::ComputeHMACSHA256(pwdHash, 32, chal.challenge, 32, expectedHmac);
 
-            bool authOk = (memcmp(expectedHmac, resp.hmac, 32) == 0);
+            bool authOk = CryptoEngine::ConstantTimeEqual32(expectedHmac, resp.hmac);
 
             AuthResultPayload resPayload = {};
             resPayload.authenticated = authOk ? 1 : 0;
             CryptoEngine::RandomBytes(reinterpret_cast<uint8_t*>(&resPayload.udpSessionToken), 8);
             if (resPayload.udpSessionToken == 0) resPayload.udpSessionToken = 1;
 
+            std::string clientIpStr;
             if (authOk) {
                 CryptoEngine::ComputeHMACSHA256(pwdHash, 32, chal.salt, 32, m_srvSessionKey);
                 m_activeUdpToken = resPayload.udpSessionToken;
 
                 char ipStr[INET_ADDRSTRLEN] = {};
                 inet_ntop(AF_INET, &cliAddr.sin_addr, ipStr, sizeof(ipStr));
-                m_connectedClientIp = ipStr;
+                clientIpStr = ipStr;
+                {
+                    std::lock_guard<std::mutex> lock(m_srvInfoMutex);
+                    m_connectedClientIp = clientIpStr;
+                }
 
                 {
                     std::lock_guard<std::mutex> lock(m_srvClientUdpMutex);
@@ -2046,8 +2632,8 @@ public:
                 m_forceIdrNextFrame = true;
                 m_clientAuthorized = true;
 
-                if (SendMessageW(m_chkAutoMin, BM_GETCHECK, 0, 0) == BST_CHECKED) {
-                    ShowWindow(m_hwndMain, SW_MINIMIZE);
+                if (m_autoMinimize.load() && m_hwndMain) {
+                    PostMessageW(m_hwndMain, WM_APP_AUTO_MINIMIZE, 0, 0);
                 }
             }
 
@@ -2062,8 +2648,8 @@ public:
 
             PostMessageW(m_hwndMain, WM_APP_UPDATE_UI, 0, 0);
 
-            bool isLoopbackTest = (m_connectedClientIp == "127.0.0.1" ||
-                                   (m_clientRunning.load() && m_connectedClientIp == DetectRadminVpnIP()));
+            bool isLoopbackTest = (clientIpStr == "127.0.0.1" ||
+                                   (m_clientRunning.load() && clientIpStr == DetectRadminVpnIP()));
             FileTransferReceiver fileReceiver;
 
             while (m_serverRunning && m_clientAuthorized) {
@@ -2071,7 +2657,7 @@ public:
                 if (!RecvAllTcp(clientSock, &cHdr, sizeof(cHdr)) || cHdr.magic != MAGIC_CONTROL) break;
 
                 RECT deskRect = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
-                bool blockSelfInput = isLoopbackTest || (m_clientRunning.load() && IsWindowVisible(m_hwndViewer));
+                bool blockSelfInput = isLoopbackTest || (m_clientRunning.load() && m_viewerVisible.load());
 
                 if (cHdr.type == CTRL_MOUSE_EVENT && cHdr.payloadSize == sizeof(MouseEventPayload)) {
                     MouseEventPayload mev = {};
@@ -2114,8 +2700,9 @@ public:
                     if (!RecvAllTcp(clientSock, &fStart, sizeof(fStart))) break;
                     CryptoEngine::StreamCrypt(reinterpret_cast<uint8_t*>(&fStart), sizeof(fStart), m_srvSessionKey, 4);
                     std::wstring status;
-                    fileReceiver.OnFileStart(fStart, status);
-                    SetFileStatus(true, status);
+                    float pct = 0.0f;
+                    fileReceiver.OnFileStart(fStart, status, pct);
+                    SetFileStatus(true, status, pct);
                 } else if (cHdr.type == CTRL_FILE_CHUNK && cHdr.payloadSize > sizeof(FileChunkHeaderPayload)) {
                     FileChunkHeaderPayload chunkHdr = {};
                     if (!RecvAllTcp(clientSock, &chunkHdr, sizeof(chunkHdr))) break;
@@ -2125,15 +2712,17 @@ public:
                     if (!RecvAllTcp(clientSock, chunkData.data(), dataLen)) break;
                     CryptoEngine::StreamCrypt(chunkData.data(), dataLen, m_srvSessionKey, 5 ^ chunkHdr.offset);
                     std::wstring status;
+                    float pct = 0.0f;
                     bool notifyUi = false;
-                    fileReceiver.OnFileChunk(chunkHdr, chunkData.data(), status, notifyUi);
-                    if (notifyUi) SetFileStatus(true, status);
+                    fileReceiver.OnFileChunk(chunkHdr, chunkData.data(), status, pct, notifyUi);
+                    if (notifyUi) SetFileStatus(true, status, pct);
                 } else if (cHdr.type == CTRL_FILE_END && cHdr.payloadSize == sizeof(FileEndPayload)) {
                     FileEndPayload fEnd = {};
                     if (!RecvAllTcp(clientSock, &fEnd, sizeof(fEnd))) break;
                     std::wstring status;
-                    fileReceiver.OnFileEnd(fEnd, status);
-                    SetFileStatus(true, status);
+                    float pct = 0.0f;
+                    fileReceiver.OnFileEnd(fEnd, status, pct);
+                    SetFileStatus(true, status, pct);
                 } else if (cHdr.payloadSize > 0) {
                     std::vector<uint8_t> skip(std::min<uint32_t>(cHdr.payloadSize, MAX_CLIPBOARD_BYTES));
                     if (!RecvAllTcp(clientSock, skip.data(), skip.size())) break;
@@ -2143,12 +2732,16 @@ public:
             fileReceiver.CloseActiveFile();
             m_inputAndClip.ReleaseAllHeldKeys();
             m_clientAuthorized = false;
-            m_connectedClientIp.clear();
+            {
+                std::lock_guard<std::mutex> lock(m_srvInfoMutex);
+                m_connectedClientIp.clear();
+            }
             closesocket(clientSock);
             m_srvClientTcp = INVALID_SOCKET;
             PostMessageW(m_hwndMain, WM_APP_UPDATE_UI, 0, 0);
         }
 
+        SecureZeroMemory(password.data(), password.size());
         if (udpHandshakeListener.joinable()) udpHandshakeListener.join();
     }
 
@@ -2261,62 +2854,67 @@ public:
     // КЛИЕНТСКАЯ ЛОГИКА
     // ========================================================================
     void ScanNetworkForServers() {
+        if (m_scanInProgress.exchange(true)) return;
         SendMessageW(m_listHosts, LB_RESETCONTENT, 0, 0);
         {
             std::lock_guard<std::mutex> lock(m_hostsMutex);
             m_discoveredHosts.clear();
         }
+        RefreshButtonVisualStates();
 
         std::thread([this]() {
             SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-            if (s == INVALID_SOCKET) return;
-            BOOL bcast = TRUE;
-            setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char*)&bcast, sizeof(bcast));
-            DWORD timeoutMs = 450;
-            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
-            DisableUdpConnReset(s);
+            if (s != INVALID_SOCKET) {
+                BOOL bcast = TRUE;
+                setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char*)&bcast, sizeof(bcast));
+                DWORD timeoutMs = 450;
+                setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+                DisableUdpConnReset(s);
 
-            std::vector<std::string> bcastTargets;
-            DetectRadminVpnIP(&bcastTargets);
+                std::vector<std::string> bcastTargets;
+                DetectRadminVpnIP(&bcastTargets);
 
-            DiscoveryPacket req = { MAGIC_DISCOVERY, 0 };
-            for (const auto& addrStr : bcastTargets) {
-                sockaddr_in dst = {};
-                dst.sin_family = AF_INET;
-                dst.sin_port = htons(DISCOVERY_UDP_PORT);
-                inet_pton(AF_INET, addrStr.c_str(), &dst.sin_addr);
-                sendto(s, (const char*)&req, sizeof(req), 0, (sockaddr*)&dst, sizeof(dst));
-            }
+                DiscoveryPacket req = { MAGIC_DISCOVERY, 0 };
+                for (const auto& addrStr : bcastTargets) {
+                    sockaddr_in dst = {};
+                    dst.sin_family = AF_INET;
+                    dst.sin_port = htons(DISCOVERY_UDP_PORT);
+                    inet_pton(AF_INET, addrStr.c_str(), &dst.sin_addr);
+                    sendto(s, (const char*)&req, sizeof(req), 0, (sockaddr*)&dst, sizeof(dst));
+                }
 
-            uint64_t start = NowMicros();
-            while (NowMicros() - start < 600000ULL) {
-                DiscoveryPacket resp = {};
-                sockaddr_in from = {};
-                int fromLen = sizeof(from);
-                int r = recvfrom(s, (char*)&resp, sizeof(resp), 0, (sockaddr*)&from, &fromLen);
-                if (r == sizeof(DiscoveryPacket) && resp.magic == MAGIC_DISCOVERY && resp.isResponse == 1) {
-                    char fromIp[INET_ADDRSTRLEN] = {};
-                    inet_ntop(AF_INET, &from.sin_addr, fromIp, sizeof(fromIp));
+                uint64_t start = NowMicros();
+                while (NowMicros() - start < 600000ULL) {
+                    DiscoveryPacket resp = {};
+                    sockaddr_in from = {};
+                    int fromLen = sizeof(from);
+                    int r = recvfrom(s, (char*)&resp, sizeof(resp), 0, (sockaddr*)&from, &fromLen);
+                    if (r == sizeof(DiscoveryPacket) && resp.magic == MAGIC_DISCOVERY && resp.isResponse == 1) {
+                        char fromIp[INET_ADDRSTRLEN] = {};
+                        inet_ntop(AF_INET, &from.sin_addr, fromIp, sizeof(fromIp));
 
-                    DiscoveredHostInfo info;
-                    info.name = resp.serverName;
-                    info.ip = (resp.serverIp[0] && strcmp(resp.serverIp, "127.0.0.1") != 0) ? resp.serverIp : fromIp;
-                    info.port = resp.port;
-                    info.width = resp.width;
-                    info.height = resp.height;
+                        DiscoveredHostInfo info;
+                        info.name = resp.serverName;
+                        info.ip = (resp.serverIp[0] && strcmp(resp.serverIp, "127.0.0.1") != 0) ? resp.serverIp : fromIp;
+                        info.port = resp.port;
+                        info.width = resp.width;
+                        info.height = resp.height;
 
-                    bool exists = false;
-                    {
-                        std::lock_guard<std::mutex> lock(m_hostsMutex);
-                        for (const auto& h : m_discoveredHosts) {
-                            if (h.ip == info.ip && h.port == info.port) { exists = true; break; }
+                        bool exists = false;
+                        {
+                            std::lock_guard<std::mutex> lock(m_hostsMutex);
+                            for (const auto& h : m_discoveredHosts) {
+                                if (h.ip == info.ip && h.port == info.port) { exists = true; break; }
+                            }
+                            if (!exists) m_discoveredHosts.push_back(info);
                         }
-                        if (!exists) m_discoveredHosts.push_back(info);
-                    }
-                    if (!exists) PostMessageW(m_hwndMain, WM_APP_HOST_FOUND, 0, 0);
-                } else if (r <= 0) break;
+                        if (!exists && m_hwndMain) PostMessageW(m_hwndMain, WM_APP_HOST_FOUND, 0, 0);
+                    } else if (r <= 0) break;
+                }
+                closesocket(s);
             }
-            closesocket(s);
+            m_scanInProgress = false;
+            if (m_hwndMain) PostMessageW(m_hwndMain, WM_APP_UPDATE_UI, 0, 0);
         }).detach();
     }
 
@@ -2329,6 +2927,7 @@ public:
         GetWindowTextA(m_editCliPass, passBuf, sizeof(passBuf));
 
         std::string hostIp = ipBuf, password = passBuf;
+        SecureZeroMemory(passBuf, sizeof(passBuf));
         uint16_t port = (uint16_t)std::atoi(portBuf);
         if (port == 0) port = DEFAULT_STREAM_PORT;
 
@@ -2376,9 +2975,11 @@ public:
         }
 
         std::vector<uint8_t> pwdSalt(password.begin(), password.end());
+        SecureZeroMemory(password.data(), password.size());
         pwdSalt.insert(pwdSalt.end(), chal.salt, chal.salt + 32);
         uint8_t pwdHash[32] = {};
         CryptoEngine::ComputeSHA256(pwdSalt.data(), pwdSalt.size(), pwdHash);
+        SecureZeroMemory(pwdSalt.data(), pwdSalt.size());
 
         AuthResponsePayload authResp = {};
         CryptoEngine::ComputeHMACSHA256(pwdHash, 32, chal.challenge, 32, authResp.hmac);
@@ -2399,21 +3000,22 @@ public:
         }
 
         CryptoEngine::ComputeHMACSHA256(pwdHash, 32, chal.salt, 32, m_cliSessionKey);
+        SecureZeroMemory(pwdHash, sizeof(pwdHash));
         m_cliUdpToken = resPayload.udpSessionToken;
         m_cliTcpSock = tcpSock;
         m_cliUdpSock = udpSock;
 
         PositionViewerWindowAdaptively(chal.screenWidth, chal.screenHeight);
         ShowWindow(m_hwndViewer, SW_SHOW);
+        m_viewerVisible = true;
         SetForegroundWindow(m_hwndViewer);
         m_renderer.Initialize(m_hwndViewer);
 
         m_clientRunning = true;
-        SetWindowTextW(m_btnCliConnect, L"Отключиться");
+        RefreshButtonVisualStates();
 
         m_cliTcpThread = std::thread(&RemoteDesktopApp::ClientTcpControlLoop, this);
         m_cliUdpThread = std::thread(&RemoteDesktopApp::ClientUdpVideoLoop, this, srvAddr);
-        UpdateStatusLabels();
     }
 
     void PositionViewerWindowAdaptively(uint32_t remoteW, uint32_t remoteH) {
@@ -2451,9 +3053,13 @@ public:
         if (m_cliUdpThread.joinable()) m_cliUdpThread.join();
 
         m_renderer.Shutdown();
-        ShowWindow(m_hwndViewer, SW_HIDE);
-        SetWindowTextW(m_btnCliConnect, L"Подключиться");
-        UpdateStatusLabels();
+        m_viewerVisible = false;
+        if (IsWindow(m_hwndViewer)) ShowWindow(m_hwndViewer, SW_HIDE);
+        m_cliFps = 0;
+        m_cliEncodeUs = 0;
+        m_cliDecodeUs = 0;
+        m_cliRttUs = 0;
+        RefreshButtonVisualStates();
     }
 
     void ClientTcpControlLoop() {
@@ -2504,8 +3110,9 @@ public:
                 if (!RecvAllTcp(m_cliTcpSock, &fStart, sizeof(fStart))) break;
                 CryptoEngine::StreamCrypt(reinterpret_cast<uint8_t*>(&fStart), sizeof(fStart), m_cliSessionKey, 4);
                 std::wstring status;
-                fileReceiver.OnFileStart(fStart, status);
-                SetFileStatus(false, status);
+                float pct = 0.0f;
+                fileReceiver.OnFileStart(fStart, status, pct);
+                SetFileStatus(false, status, pct);
             } else if (cHdr.type == CTRL_FILE_CHUNK && cHdr.payloadSize > sizeof(FileChunkHeaderPayload)) {
                 FileChunkHeaderPayload chunkHdr = {};
                 if (!RecvAllTcp(m_cliTcpSock, &chunkHdr, sizeof(chunkHdr))) break;
@@ -2515,15 +3122,17 @@ public:
                 if (!RecvAllTcp(m_cliTcpSock, chunkData.data(), dataLen)) break;
                 CryptoEngine::StreamCrypt(chunkData.data(), dataLen, m_cliSessionKey, 5 ^ chunkHdr.offset);
                 std::wstring status;
+                float pct = 0.0f;
                 bool notifyUi = false;
-                fileReceiver.OnFileChunk(chunkHdr, chunkData.data(), status, notifyUi);
-                if (notifyUi) SetFileStatus(false, status);
+                fileReceiver.OnFileChunk(chunkHdr, chunkData.data(), status, pct, notifyUi);
+                if (notifyUi) SetFileStatus(false, status, pct);
             } else if (cHdr.type == CTRL_FILE_END && cHdr.payloadSize == sizeof(FileEndPayload)) {
                 FileEndPayload fEnd = {};
                 if (!RecvAllTcp(m_cliTcpSock, &fEnd, sizeof(fEnd))) break;
                 std::wstring status;
-                fileReceiver.OnFileEnd(fEnd, status);
-                SetFileStatus(false, status);
+                float pct = 0.0f;
+                fileReceiver.OnFileEnd(fEnd, status, pct);
+                SetFileStatus(false, status, pct);
             } else if (cHdr.payloadSize > 0) {
                 std::vector<uint8_t> skip(std::min<uint32_t>(cHdr.payloadSize, MAX_CLIPBOARD_BYTES));
                 if (!RecvAllTcp(m_cliTcpSock, skip.data(), skip.size())) break;
@@ -2531,7 +3140,7 @@ public:
         }
 
         fileReceiver.CloseActiveFile();
-        if (m_clientRunning) PostMessageW(m_hwndMain, WM_APP_CLIENT_LOST, 0, 0);
+        if (m_clientRunning && m_hwndMain) PostMessageW(m_hwndMain, WM_APP_CLIENT_LOST, 0, 0);
     }
 
     void ClientUdpVideoLoop(sockaddr_in srvUdpAddr) {
@@ -2646,7 +3255,7 @@ public:
                 m_cliFps = fpsCounter;
                 fpsCounter = 0;
                 fpsTimer = now;
-                PostMessageW(m_hwndMain, WM_APP_UPDATE_UI, 0, 0);
+                if (m_hwndMain) PostMessageW(m_hwndMain, WM_APP_UPDATE_UI, 0, 0);
             }
         }
         CoUninitialize();
@@ -2744,177 +3353,1077 @@ public:
     }
 
     // ========================================================================
-    // АДАПТИВНАЯ КОМПОНОВКА ОКНА
+    // АДАПТИВНАЯ КОМПОНОВКА, КНОПКИ И ВЗАИМОДЕЙСТВИЕ В ГЛАВНОМ МЕНЮ
     // ========================================================================
+    void InitCanvasWidgets() {
+        m_buttons[0] = { IDC_BTN_SRV_TOGGLE,   {}, L"Запустить сервер",                  BTN_VAR_PRIMARY_GREEN, true };
+        m_buttons[1] = { IDC_BTN_SRV_TRAY,     {}, L"Свернуть в трей",                   BTN_VAR_SECONDARY,     true };
+        m_buttons[2] = { IDC_BTN_SRV_SENDFILE, {}, L"Отправить файл клиенту...",         BTN_VAR_SECONDARY,     false };
+        m_buttons[3] = { IDC_BTN_CLI_SCAN,     {}, L"Поиск серверов в сети Radmin VPN",  BTN_VAR_SECONDARY,     true };
+        m_buttons[4] = { IDC_BTN_CLI_CONNECT,  {}, L"Подключиться",                      BTN_VAR_PRIMARY_BLUE,  true };
+        m_buttons[5] = { IDC_BTN_CLI_SENDFILE, {}, L"Отправить файл...",                 BTN_VAR_SECONDARY,     false };
+
+        m_autoMinToggle.label = L"Сворачивать панель при подключении клиента";
+        m_autoMinToggle.checked = false;
+        m_autoMinToggle.knobT = 0.0f;
+
+        RefreshButtonVisualStates();
+    }
+
+    void RefreshButtonVisualStates() {
+        bool srvRun  = m_serverRunning.load();
+        bool srvAuth = m_clientAuthorized.load();
+        bool cliRun  = m_clientRunning.load();
+        bool scanning = m_scanInProgress.load();
+
+        m_buttons[0].text    = srvRun ? L"Остановить сервер" : L"Запустить сервер";
+        m_buttons[0].variant = srvRun ? BTN_VAR_DANGER : BTN_VAR_PRIMARY_GREEN;
+
+        m_buttons[2].enabled = (srvRun && srvAuth);
+        m_buttons[2].variant = (srvRun && srvAuth) ? BTN_VAR_PRIMARY_BLUE : BTN_VAR_SECONDARY;
+
+        m_buttons[3].text    = scanning ? L"Поиск серверов в сети..." : L"Поиск серверов в сети Radmin VPN";
+        m_buttons[3].enabled = !scanning;
+
+        m_buttons[4].text    = cliRun ? L"Отключиться" : L"Подключиться";
+        m_buttons[4].variant = cliRun ? BTN_VAR_DANGER : BTN_VAR_PRIMARY_BLUE;
+
+        m_buttons[5].enabled = cliRun;
+        m_buttons[5].variant = cliRun ? BTN_VAR_PRIMARY_BLUE : BTN_VAR_SECONDARY;
+
+        UpdateViewerTitle();
+    }
+
+    void UpdateViewerTitle() {
+        if (!m_clientRunning || !IsWindow(m_hwndViewer)) return;
+        std::wstringstream titleSs;
+        titleSs << L"Radmin Ultra-Low Latency Viewer — FPS: " << m_cliFps.load()
+                << L" | Enc: " << std::fixed << std::setprecision(1) << (m_cliEncodeUs.load() / 1000.0) << L"ms"
+                << L" | Dec: " << (m_cliDecodeUs.load() / 1000.0) << L"ms"
+                << L" | RTT: " << (m_cliRttUs.load() / 1000.0) << L"ms"
+                << L" | [Ctrl+Alt+F - Полный экран | Drag&Drop файла]";
+        SetWindowTextW(m_hwndViewer, titleSs.str().c_str());
+    }
+
     void UpdateFontsForDpi(UINT dpi) {
-        int fontHeight = -MulDiv(10, dpi, 72);
-        HFONT newFont = CreateFontW(fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-        HFONT newBold = CreateFontW(fontHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        int editH = -MulDiv(10, dpi, 72);
+        int listH = -MulDiv(9, dpi, 72);
+        HFONT newEditFont = CreateFontW(editH, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        HFONT newListFont = CreateFontW(listH, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        HFONT newListBold = CreateFontW(listH, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
 
-        HWND normalCtrls[] = {
-            m_lblSrvName, m_editSrvName, m_lblSrvPass, m_editSrvPass,
-            m_lblSrvPort, m_editSrvPort, m_chkAutoMin, m_btnSrvTray, m_lblSrvStatus,
-            m_listHosts, m_lblCliIp, m_editCliIp, m_editCliPort,
-            m_lblCliPass, m_editCliPass, m_lblCliStatus
-        };
-        HWND boldCtrls[] = {
-            m_grpServer, m_btnSrvToggle, m_btnSrvSendFile,
-            m_grpClient, m_btnCliScan, m_btnCliConnect, m_btnCliSendFile
-        };
+        HWND edits[] = { m_editSrvName, m_editSrvPass, m_editSrvPort, m_editCliIp, m_editCliPort, m_editCliPass };
+        for (HWND h : edits) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)newEditFont, TRUE);
+        if (m_listHosts) {
+            SendMessageW(m_listHosts, WM_SETFONT, (WPARAM)newListFont, TRUE);
+            SendMessageW(m_listHosts, LB_SETITEMHEIGHT, 0, MulDiv(28, dpi, 96));
+        }
 
-        for (HWND h : normalCtrls) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)newFont, TRUE);
-        for (HWND h : boldCtrls)   if (h) SendMessageW(h, WM_SETFONT, (WPARAM)newBold, TRUE);
-
-        if (m_hFont) DeleteObject(m_hFont);
-        if (m_hFontBold) DeleteObject(m_hFontBold);
-        m_hFont = newFont;
-        m_hFontBold = newBold;
+        if (m_hEditFont) DeleteObject(m_hEditFont);
+        if (m_hListFont) DeleteObject(m_hListFont);
+        if (m_hListFontBold) DeleteObject(m_hListFontBold);
+        m_hEditFont = newEditFont;
+        m_hListFont = newListFont;
+        m_hListFontBold = newListBold;
+        m_mainCanvas.UpdateFontsForDpi(dpi);
     }
 
     void RelayoutMainWindow() {
-        if (!m_hwndMain || !m_grpServer) return;
+        if (!m_hwndMain || !m_editSrvName) return;
         RECT rc = {};
         GetClientRect(m_hwndMain, &rc);
         int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
         if (cw <= 50 || ch <= 50) return;
 
         UINT dpi = GetDpiForWindow(m_hwndMain);
-        auto S = [&](int v) { return MulDiv(v, dpi, 96); };
+        auto S = [&](int v) { return (float)MulDiv(v, dpi, 96); };
+        auto Si = [&](int v) { return MulDiv(v, dpi, 96); };
 
-        int margin = S(12), gap = S(12);
-        int colW = (cw - margin * 2 - gap) / 2;
-        int grpH = ch - margin * 2;
-        int leftX = margin, rightX = margin + colW + gap;
-        int innerPad = S(14), rowH = S(26), btnH = S(32), vStep = S(32);
+        float headerH = S(62);
+        m_headerRect = D2D1::RectF(0.0f, 0.0f, (float)cw, headerH);
 
-        HDWP hdwp = BeginDeferWindowPos(24);
-        auto Place = [&](HWND h, int x, int y, int w, int ht) {
-            if (h) hdwp = DeferWindowPos(hdwp, h, nullptr, x, y, std::max(10, w), std::max(10, ht), SWP_NOZORDER | SWP_NOACTIVATE);
+        float margin = S(16);
+        float gap = S(16);
+        float colW = ((float)cw - margin * 2.0f - gap) * 0.5f;
+        float cardTop = headerH + S(14);
+        float cardH = (float)ch - cardTop - margin;
+        float leftX = margin;
+        float rightX = margin + colW + gap;
+        float pad = S(18);
+        float sw = colW - pad * 2.0f;
+
+        m_srvCardRect = D2D1::RectF(leftX, cardTop, leftX + colW, cardTop + cardH);
+        m_cliCardRect = D2D1::RectF(rightX, cardTop, rightX + colW, cardTop + cardH);
+
+        // Внутренняя геометрия поля ввода (рамка + отступы вокруг Win32 EDIT)
+        int editInsetX = Si(9);
+        int editInsetY = Si(6);
+        float rowH = S(32);
+        float rowStep = S(40);
+        float btnH = S(34);
+
+        HDWP hdwp = BeginDeferWindowPos(10);
+        auto PlaceInput = [&](size_t idx, HWND hEdit, const std::wstring& lbl,
+                              float x, float y, float lblW, float boxW) {
+            m_inputFrames[idx].hwnd = hEdit;
+            m_inputFrames[idx].label = lbl;
+            m_inputFrames[idx].labelRect = D2D1::RectF(x, y, x + lblW, y + rowH);
+            float bx = x + lblW + S(8);
+            m_inputFrames[idx].rect = D2D1::RectF(bx, y, bx + boxW, y + rowH);
+            if (hEdit) {
+                hdwp = DeferWindowPos(hdwp, hEdit, nullptr,
+                    (int)bx + editInsetX, (int)y + editInsetY,
+                    std::max(10, (int)boxW - editInsetX * 2),
+                    std::max(10, (int)rowH - editInsetY * 2),
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         };
 
-        // Левая колонка: Сервер
-        Place(m_grpServer, leftX, margin, colW, grpH);
-        int sx = leftX + innerPad, sw = colW - innerPad * 2;
-        int lblW = std::min(S(155), sw / 2), edtW = sw - lblW - S(6);
-        int sy = margin + S(26);
+        // --- ЛЕВАЯ КАРТОЧКА: СЕРВЕР ---
+        float sx = leftX + pad;
+        float sy = cardTop + S(52);
+        float srvLblW = std::min(S(165), sw * 0.45f);
+        float srvBoxW = sw - srvLblW - S(8);
 
-        Place(m_lblSrvName,  sx, sy + S(3), lblW, rowH);
-        Place(m_editSrvName, sx + lblW + S(6), sy, edtW, rowH);
-        sy += vStep;
+        PlaceInput(0, m_editSrvName, L"Имя машины / сервера:", sx, sy, srvLblW, srvBoxW); sy += rowStep;
+        PlaceInput(1, m_editSrvPass, L"Пароль доступа:",       sx, sy, srvLblW, srvBoxW); sy += rowStep;
+        PlaceInput(2, m_editSrvPort, L"Порт (TCP + UDP):",     sx, sy, srvLblW, srvBoxW); sy += rowStep;
 
-        Place(m_lblSrvPass,  sx, sy + S(3), lblW, rowH);
-        Place(m_editSrvPass, sx + lblW + S(6), sy, edtW, rowH);
-        sy += vStep;
+        float toggleH = S(24);
+        float trackW = S(38), trackH = S(20);
+        m_autoMinToggle.hitRect = D2D1::RectF(sx, sy, sx + sw, sy + toggleH);
+        m_autoMinToggle.trackRect = D2D1::RectF(sx, sy + (toggleH - trackH) * 0.5f,
+                                                sx + trackW, sy + (toggleH + trackH) * 0.5f);
+        sy += toggleH + S(12);
 
-        Place(m_lblSrvPort,  sx, sy + S(3), lblW, rowH);
-        Place(m_editSrvPort, sx + lblW + S(6), sy, edtW, rowH);
-        sy += vStep;
+        float halfW = (sw - S(10)) * 0.5f;
+        m_buttons[0].rect = D2D1::RectF(sx, sy, sx + halfW, sy + btnH);
+        m_buttons[1].rect = D2D1::RectF(sx + halfW + S(10), sy, sx + sw, sy + btnH);
+        sy += btnH + S(10);
 
-        Place(m_chkAutoMin, sx, sy, sw, S(22));
-        sy += S(26);
+        m_buttons[2].rect = D2D1::RectF(sx, sy, sx + sw, sy + btnH);
+        sy += btnH + S(14);
 
-        int halfBtnW = (sw - S(8)) / 2;
-        Place(m_btnSrvToggle, sx, sy, halfBtnW, btnH);
-        Place(m_btnSrvTray,   sx + halfBtnW + S(8), sy, sw - halfBtnW - S(8), btnH);
-        sy += btnH + S(6);
+        m_srvStatusBoxRect = D2D1::RectF(sx, sy, sx + sw, std::max(sy + S(70), cardTop + cardH - pad));
 
-        Place(m_btnSrvSendFile, sx, sy, sw, btnH);
-        sy += btnH + S(8);
+        // --- ПРАВАЯ КАРТОЧКА: КЛИЕНТ ---
+        float cx = rightX + pad;
+        float cy = cardTop + S(52);
+        m_buttons[3].rect = D2D1::RectF(cx, cy, cx + sw, cy + S(32));
+        cy += S(42);
 
-        int srvStatusH = (margin + grpH) - sy - innerPad;
-        Place(m_lblSrvStatus, sx, sy, sw, std::max(S(55), srvStatusH));
+        float reservedCliBottom = rowStep * 2.0f + btnH + S(14) + S(86) + pad;
+        float listH = std::max(S(68), (cardTop + cardH) - cy - reservedCliBottom);
+        m_listFrameRect = D2D1::RectF(cx, cy, cx + sw, cy + listH);
+        if (m_listHosts) {
+            int listPad = Si(4);
+            hdwp = DeferWindowPos(hdwp, m_listHosts, nullptr,
+                (int)cx + listPad, (int)cy + listPad,
+                std::max(10, (int)sw - listPad * 2), std::max(10, (int)listH - listPad * 2),
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        cy += listH + S(12);
 
-        // Правая колонка: Клиент
-        Place(m_grpClient, rightX, margin, colW, grpH);
-        int cx = rightX + innerPad, clW = colW - innerPad * 2;
-        int cy = margin + S(26);
+        float cliLblW = std::min(S(130), sw * 0.34f);
+        float portBoxW = S(76);
+        float ipBoxW = sw - cliLblW - portBoxW - S(16);
+        PlaceInput(3, m_editCliIp, L"IP и порт хоста:", cx, cy, cliLblW, ipBoxW);
 
-        Place(m_btnCliScan, cx, cy, clW, S(28));
-        cy += S(34);
+        // Поле порта клиента справа от IP
+        float portX = cx + cliLblW + S(8) + ipBoxW + S(8);
+        m_inputFrames[4].hwnd = m_editCliPort;
+        m_inputFrames[4].label.clear();
+        m_inputFrames[4].rect = D2D1::RectF(portX, cy, portX + portBoxW, cy + rowH);
+        if (m_editCliPort) {
+            hdwp = DeferWindowPos(hdwp, m_editCliPort, nullptr,
+                (int)portX + editInsetX, (int)cy + editInsetY,
+                std::max(10, (int)portBoxW - editInsetX * 2),
+                std::max(10, (int)rowH - editInsetY * 2),
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        cy += rowStep;
 
-        int bottomControlsH = vStep * 2 + btnH + S(75) + innerPad;
-        int listH = std::max(S(60), (margin + grpH) - cy - bottomControlsH);
-        Place(m_listHosts, cx, cy, clW, listH);
-        cy += listH + S(8);
+        PlaceInput(5, m_editCliPass, L"Пароль сервера:", cx, cy, cliLblW, sw - cliLblW - S(8));
+        cy += rowStep;
 
-        int cliLblW = std::min(S(120), clW / 3);
-        int portW = S(75);
-        int ipW = clW - cliLblW - portW - S(12);
-        Place(m_lblCliIp,    cx, cy + S(3), cliLblW, rowH);
-        Place(m_editCliIp,   cx + cliLblW + S(6), cy, ipW, rowH);
-        Place(m_editCliPort, cx + cliLblW + ipW + S(12), cy, portW, rowH);
-        cy += vStep;
+        float cliHalfW = (sw - S(10)) * 0.5f;
+        m_buttons[4].rect = D2D1::RectF(cx, cy, cx + cliHalfW, cy + btnH);
+        m_buttons[5].rect = D2D1::RectF(cx + cliHalfW + S(10), cy, cx + sw, cy + btnH);
+        cy += btnH + S(14);
 
-        Place(m_lblCliPass,  cx, cy + S(3), cliLblW, rowH);
-        Place(m_editCliPass, cx + cliLblW + S(6), cy, clW - cliLblW - S(6), rowH);
-        cy += vStep;
-
-        int cliHalfBtn = (clW - S(8)) / 2;
-        Place(m_btnCliConnect,  cx, cy, cliHalfBtn, btnH);
-        Place(m_btnCliSendFile, cx + cliHalfBtn + S(8), cy, clW - cliHalfBtn - S(8), btnH);
-        cy += btnH + S(8);
-
-        int cliStatusH = (margin + grpH) - cy - innerPad;
-        Place(m_lblCliStatus, cx, cy, clW, std::max(S(50), cliStatusH));
+        m_cliStatusBoxRect = D2D1::RectF(cx, cy, cx + sw, std::max(cy + S(70), cardTop + cardH - pad));
 
         EndDeferWindowPos(hdwp);
-        InvalidateRect(m_hwndMain, nullptr, TRUE);
+        InvalidateRect(m_hwndMain, nullptr, FALSE);
     }
 
-    void UpdateStatusLabels() {
-        m_radminIp = DetectRadminVpnIP();
-        std::wstring srvFileStr, cliFileStr;
-        {
-            std::lock_guard<std::mutex> lock(m_fileStatusMutex);
-            srvFileStr = m_srvFileStatus;
-            cliFileStr = m_cliFileStatus;
+    int HitTestMainButton(POINT pt) const {
+        for (const auto& b : m_buttons) {
+            if (b.enabled && pt.x >= b.rect.left && pt.x <= b.rect.right &&
+                pt.y >= b.rect.top && pt.y <= b.rect.bottom) {
+                return b.id;
+            }
+        }
+        return -1;
+    }
+
+    bool HitTestAutoMinToggle(POINT pt) const {
+        const auto& r = m_autoMinToggle.hitRect;
+        return pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom;
+    }
+
+    void OnMainCanvasButtonClick(int id) {
+        switch (id) {
+        case IDC_BTN_SRV_TOGGLE:
+            if (!m_serverRunning) StartServerWithPinPrompt(); else StopServer();
+            break;
+        case IDC_BTN_SRV_TRAY:
+            ShowInTray(true);
+            break;
+        case IDC_BTN_SRV_SENDFILE:
+            PromptAndSendFile(true);
+            break;
+        case IDC_BTN_CLI_SCAN:
+            ScanNetworkForServers();
+            break;
+        case IDC_BTN_CLI_CONNECT:
+            if (!m_clientRunning) ConnectToServer(); else DisconnectClient();
+            break;
+        case IDC_BTN_CLI_SENDFILE:
+            PromptAndSendFile(false);
+            break;
+        }
+    }
+
+    void DrawStyledButton(D2DOffscreenTarget& target, ID2D1DCRenderTarget* rt, const CanvasButton& btn, float scale) {
+        D2D1_COLOR_F baseBg = HexColor(0x1E2638);
+        D2D1_COLOR_F hoverBg = HexColor(0x28334A);
+        D2D1_COLOR_F pressBg = HexColor(0x161D2B);
+        D2D1_COLOR_F borderCol = HexColor(0x31405C);
+        D2D1_COLOR_F txtCol = HexColor(0xE2E8F0);
+
+        if (!btn.enabled) {
+            baseBg = hoverBg = pressBg = HexColor(0x151B28);
+            borderCol = HexColor(0x20293B);
+            txtCol = HexColor(0x52607A);
+        } else if (btn.variant == BTN_VAR_PRIMARY_BLUE) {
+            baseBg = HexColor(0x2563EB);
+            hoverBg = HexColor(0x3B82F6);
+            pressBg = HexColor(0x1D4ED8);
+            borderCol = HexColor(0x60A5FA, 0.55f);
+            txtCol = HexColor(0xFFFFFF);
+        } else if (btn.variant == BTN_VAR_PRIMARY_GREEN) {
+            baseBg = HexColor(0x059669);
+            hoverBg = HexColor(0x10B981);
+            pressBg = HexColor(0x047857);
+            borderCol = HexColor(0x34D399, 0.55f);
+            txtCol = HexColor(0xFFFFFF);
+        } else if (btn.variant == BTN_VAR_DANGER) {
+            baseBg = HexColor(0xDC2626);
+            hoverBg = HexColor(0xEF4444);
+            pressBg = HexColor(0xB91C1C);
+            borderCol = HexColor(0xFCA5A5, 0.5f);
+            txtCol = HexColor(0xFFFFFF);
+        } else if (btn.variant == BTN_VAR_GHOST) {
+            baseBg = HexColor(0x141A27, 0.0f);
+            hoverBg = HexColor(0x253047);
+            pressBg = HexColor(0x1C2538);
+            borderCol = HexColor(0x2C3852, btn.hoverT);
+            txtCol = LerpColor(HexColor(0x94A3B8), HexColor(0xF8FAFC), btn.hoverT);
         }
 
-        std::wstringstream srvSs;
-        srvSs << L"IP в Radmin VPN: " << std::wstring(m_radminIp.begin(), m_radminIp.end())
-              << L" : " << m_serverPort << L"\r\n";
-        if (!m_serverRunning) {
-            srvSs << L"Статус: Сервер остановлен\r\n" << srvFileStr;
-        } else if (!m_clientAuthorized) {
-            srvSs << L"Статус: Ожидание подключения (Discovery UDP:" << DISCOVERY_UDP_PORT << L")\r\n" << srvFileStr;
-        } else {
-            srvSs << L"Статус: Активен клиент [" << std::wstring(m_connectedClientIp.begin(), m_connectedClientIp.end()) << L"]\r\n"
-                  << L"FPS: " << m_srvFps.load()
-                  << L" | Enc: " << std::fixed << std::setprecision(1) << (m_srvEncodeUs.load() / 1000.0) << L"ms"
-                  << L" | Dec: " << (m_srvClientDecodeUs.load() / 1000.0) << L"ms"
-                  << L" | RTT: " << (m_srvRttUs.load() / 1000.0) << L"ms\r\n"
-                  << srvFileStr;
-        }
-        SetWindowTextW(m_lblSrvStatus, srvSs.str().c_str());
+        D2D1_COLOR_F fill = LerpColor(baseBg, hoverBg, btn.hoverT);
+        fill = LerpColor(fill, pressBg, btn.pressT);
 
-        std::wstringstream cliSs;
-        if (!m_clientRunning) {
-            cliSs << L"Статус: Отключен. Нажмите «Поиск серверов» или введите IP.\r\n" << cliFileStr;
-        } else {
-            cliSs << L"Статус: Трансляция активна (Ctrl+Alt+F — полный экран)\r\n"
-                  << L"FPS: " << m_cliFps.load()
-                  << L" | Enc: " << std::fixed << std::setprecision(1) << (m_cliEncodeUs.load() / 1000.0) << L"ms"
-                  << L" | Dec: " << (m_cliDecodeUs.load() / 1000.0) << L"ms"
-                  << L" | RTT: " << (m_cliRttUs.load() / 1000.0) << L"ms\r\n"
-                  << cliFileStr;
-
-            std::wstringstream titleSs;
-            titleSs << L"Radmin Ultra-Low Latency Viewer — FPS: " << m_cliFps.load()
-                    << L" | Enc: " << std::fixed << std::setprecision(1) << (m_cliEncodeUs.load() / 1000.0) << L"ms"
-                    << L" | Dec: " << (m_cliDecodeUs.load() / 1000.0) << L"ms"
-                    << L" | RTT: " << (m_cliRttUs.load() / 1000.0) << L"ms"
-                    << L" | [Ctrl+Alt+F - Полный экран | Drag&Drop файла]";
-            SetWindowTextW(m_hwndViewer, titleSs.str().c_str());
+        float radius = 8.0f * scale;
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(btn.rect, radius, radius);
+        rt->FillRoundedRectangle(rr, target.Brush(fill));
+        if (borderCol.a > 0.01f) {
+            rt->DrawRoundedRectangle(rr, target.Brush(borderCol), 1.0f * scale);
         }
-        SetWindowTextW(m_lblCliStatus, cliSs.str().c_str());
+
+        if (btn.enabled && btn.hoverT > 0.02f && btn.variant != BTN_VAR_GHOST) {
+            D2D1_ROUNDED_RECT topHighlight = D2D1::RoundedRect(
+                D2D1::RectF(btn.rect.left + 1.0f, btn.rect.top + 1.0f, btn.rect.right - 1.0f, btn.rect.bottom - 1.0f),
+                radius, radius);
+            rt->DrawRoundedRectangle(topHighlight, target.Brush(HexColor(0xFFFFFF, 0.08f * btn.hoverT)), 1.0f);
+        }
+
+        target.DrawTextBox(btn.text, target.FmtButton(), btn.rect, txtCol);
+    }
+
+    void DrawBadgePill(D2DOffscreenTarget& target, ID2D1DCRenderTarget* rt, float rightX, float centerY,
+                       const std::wstring& text, const D2D1_COLOR_F& dotCol, const D2D1_COLOR_F& bgCol,
+                       const D2D1_COLOR_F& borderCol, const D2D1_COLOR_F& txtCol, float scale, float pulseAlpha) {
+        float w = (float)(text.size() * 6.5 + 34.0) * scale;
+        float h = 24.0f * scale;
+        D2D1_RECT_F pill = D2D1::RectF(rightX - w, centerY - h * 0.5f, rightX, centerY + h * 0.5f);
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(pill, h * 0.5f, h * 0.5f);
+        rt->FillRoundedRectangle(rr, target.Brush(bgCol));
+        rt->DrawRoundedRectangle(rr, target.Brush(borderCol), 1.0f * scale);
+
+        float dotX = pill.left + 12.0f * scale;
+        if (pulseAlpha > 0.01f) {
+            D2D1_COLOR_F halo = dotCol;
+            halo.a = pulseAlpha * 0.35f;
+            rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, centerY), 6.5f * scale, 6.5f * scale), target.Brush(halo));
+        }
+        rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(dotX, centerY), 3.6f * scale, 3.6f * scale), target.Brush(dotCol));
+
+        D2D1_RECT_F txtRect = D2D1::RectF(dotX + 7.0f * scale, pill.top, pill.right - 8.0f * scale, pill.bottom);
+        target.DrawTextBox(text, target.FmtBadge(), txtRect, txtCol);
     }
 };
 
 static RemoteDesktopApp g_app;
+
+// ============================================================================
+// РЕАЛИЗАЦИЯ КАДРОВОГО ТИКА, ОТРИСОВКИ ГЛАВНОГО МЕНЮ И МОДАЛЬНОГО ДИАЛОГА PIN
+// ============================================================================
+void RemoteDesktopApp::TickAndRenderUi(float dt) {
+    m_pulsePhase += dt * 3.4f;
+    if (m_pulsePhase > 6.283185f) m_pulsePhase -= 6.283185f;
+
+    float srvTargetGlow = m_serverRunning.load() ? (m_clientAuthorized.load() ? 1.0f : 0.65f) : 0.0f;
+    float cliTargetGlow = m_clientRunning.load() ? 1.0f : 0.0f;
+    m_srvCardGlow = SmoothApproach(m_srvCardGlow, srvTargetGlow, 9.0f, dt);
+    m_cliCardGlow = SmoothApproach(m_cliCardGlow, cliTargetGlow, 9.0f, dt);
+
+    HWND focused = GetFocus();
+    for (auto& inp : m_inputFrames) {
+        float target = (inp.hwnd && focused == inp.hwnd) ? 1.0f : 0.0f;
+        inp.focusT = SmoothApproach(inp.focusT, target, 16.0f, dt);
+    }
+    m_listFocusT = SmoothApproach(m_listFocusT, (m_listHosts && focused == m_listHosts) ? 1.0f : 0.0f, 16.0f, dt);
+
+    for (auto& b : m_buttons) {
+        float hTarget = (b.enabled && m_hoveredBtnId == b.id && !m_modal.active) ? 1.0f : 0.0f;
+        float pTarget = (b.enabled && m_pressedBtnId == b.id && m_hoveredBtnId == b.id && !m_modal.active) ? 1.0f : 0.0f;
+        b.hoverT = SmoothApproach(b.hoverT, hTarget, 18.0f, dt);
+        b.pressT = SmoothApproach(b.pressT, pTarget, 26.0f, dt);
+    }
+
+    m_autoMinToggle.hoverT = SmoothApproach(m_autoMinToggle.hoverT, (m_hoveredToggle && !m_modal.active) ? 1.0f : 0.0f, 18.0f, dt);
+    m_autoMinToggle.knobT  = SmoothApproach(m_autoMinToggle.knobT, m_autoMinToggle.checked ? 1.0f : 0.0f, 20.0f, dt);
+
+    if (m_hwndMain && IsWindowVisible(m_hwndMain) && !IsIconic(m_hwndMain)) {
+        RedrawWindow(m_hwndMain, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOCHILDREN | RDW_NOERASE);
+    }
+
+    if (m_modal.active && m_modal.hwnd && IsWindowVisible(m_modal.hwnd)) {
+        if (m_modal.shakeTimer > 0.0f) {
+            m_modal.shakeTimer = std::max(0.0f, m_modal.shakeTimer - dt);
+        }
+        for (auto& mb : m_modal.buttons) {
+            float hTarget = (m_modal.hoveredBtnId == mb.id) ? 1.0f : 0.0f;
+            float pTarget = (m_modal.pressedBtnId == mb.id && m_modal.hoveredBtnId == mb.id) ? 1.0f : 0.0f;
+            mb.hoverT = SmoothApproach(mb.hoverT, hTarget, 18.0f, dt);
+            mb.pressT = SmoothApproach(mb.pressT, pTarget, 26.0f, dt);
+        }
+        RedrawWindow(m_modal.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOCHILDREN | RDW_NOERASE);
+    }
+}
+
+void RemoteDesktopApp::PaintMainWindow(HWND hwnd) {
+    PAINTSTRUCT ps = {};
+    HDC hdc = BeginPaint(hwnd, &ps);
+
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    uint32_t w = (uint32_t)std::max<LONG>(1, rc.right - rc.left);
+    uint32_t h = (uint32_t)std::max<LONG>(1, rc.bottom - rc.top);
+
+    ID2D1DCRenderTarget* rt = nullptr;
+    if (!m_mainCanvas.BeginFrame(hwnd, w, h, &rt)) {
+        EndPaint(hwnd, &ps);
+        return;
+    }
+
+    UINT dpi = GetDpiForWindow(hwnd);
+    float scale = (float)dpi / 96.0f;
+    float pulseWave = 0.5f + 0.5f * std::sin(m_pulsePhase);
+
+    // 1. Фон и верхняя панель заголовка
+    rt->Clear(HexColor(0x0B0F17));
+    rt->FillRectangle(m_headerRect, m_mainCanvas.Brush(HexColor(0x0F1522)));
+    rt->DrawLine(D2D1::Point2F(0.0f, m_headerRect.bottom - 0.5f),
+                 D2D1::Point2F((float)w, m_headerRect.bottom - 0.5f),
+                 m_mainCanvas.Brush(HexColor(0x1E293B)), 1.0f * scale);
+
+    // Векторный логотип в шапке
+    float logoSize = 34.0f * scale;
+    float logoX = 16.0f * scale;
+    float logoY = (m_headerRect.bottom - logoSize) * 0.5f;
+    D2D1_ROUNDED_RECT logoBox = D2D1::RoundedRect(D2D1::RectF(logoX, logoY, logoX + logoSize, logoY + logoSize),
+                                                  8.0f * scale, 8.0f * scale);
+    rt->FillRoundedRectangle(logoBox, m_mainCanvas.Brush(HexColor(0x1D4ED8, 0.28f)));
+    rt->DrawRoundedRectangle(logoBox, m_mainCanvas.Brush(HexColor(0x3B82F6, 0.75f)), 1.2f * scale);
+
+    float mPad = 7.0f * scale;
+    D2D1_ROUNDED_RECT monitorGlyph = D2D1::RoundedRect(
+        D2D1::RectF(logoX + mPad, logoY + mPad + 1.0f * scale, logoX + logoSize - mPad, logoY + logoSize - mPad - 3.0f * scale),
+        2.5f * scale, 2.5f * scale);
+    rt->DrawRoundedRectangle(monitorGlyph, m_mainCanvas.Brush(HexColor(0x60A5FA)), 1.6f * scale);
+    rt->DrawLine(D2D1::Point2F(logoX + logoSize * 0.35f, logoY + logoSize - mPad + 0.5f * scale),
+                 D2D1::Point2F(logoX + logoSize * 0.65f, logoY + logoSize - mPad + 0.5f * scale),
+                 m_mainCanvas.Brush(HexColor(0x60A5FA)), 1.6f * scale);
+
+    float titleX = logoX + logoSize + 12.0f * scale;
+    m_mainCanvas.DrawTextBox(L"Radmin Ultra RD", m_mainCanvas.FmtTitle(),
+                             D2D1::RectF(titleX, 8.0f * scale, (float)w * 0.55f, 34.0f * scale), HexColor(0xF8FAFC));
+    m_mainCanvas.DrawTextBox(L"DXGI Capture · H.264 Low-Latency · UDP Stream · Encrypted File Transfer",
+                             m_mainCanvas.FmtBadge(),
+                             D2D1::RectF(titleX, 34.0f * scale, (float)w * 0.58f, 54.0f * scale), HexColor(0x64748B));
+    // Выравнивание подзаголовка по левому краю
+    // (создаём отдельный FmtLabel с мелким текстом или используем FmtBody для левого выравнивания)
+
+    // Телеметрия в правой части шапки: FPS / Frame-Time счетчик + Radmin IP
+    float pillH = 28.0f * scale;
+    float pillY = (m_headerRect.bottom - pillH) * 0.5f;
+    float fpsPillW = 205.0f * scale;
+    float fpsPillX = (float)w - 16.0f * scale - fpsPillW;
+    D2D1_RECT_F fpsPillRect = D2D1::RectF(fpsPillX, pillY, fpsPillX + fpsPillW, pillY + pillH);
+    D2D1_ROUNDED_RECT fpsPillRR = D2D1::RoundedRect(fpsPillRect, 7.0f * scale, 7.0f * scale);
+    rt->FillRoundedRectangle(fpsPillRR, m_mainCanvas.Brush(HexColor(0x131B2B)));
+    rt->DrawRoundedRectangle(fpsPillRR, m_mainCanvas.Brush(HexColor(0x253248)), 1.0f * scale);
+
+    float uiFps = m_framePacer.GetDisplayFps();
+    float uiMs  = m_framePacer.GetDisplayFrameMs();
+    bool smoothOk = (uiMs <= (1000.0f / std::max(30u, m_framePacer.GetTargetHz())) * 1.45f);
+    D2D1_COLOR_F pacingDotCol = smoothOk ? HexColor(0x10B981) : HexColor(0xF59E0B);
+    rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(fpsPillX + 11.0f * scale, pillY + pillH * 0.5f),
+                                  3.5f * scale, 3.5f * scale), m_mainCanvas.Brush(pacingDotCol));
+
+    std::wstringstream fpsSs;
+    fpsSs << std::fixed << std::setprecision(1) << uiFps << L" FPS · " << std::setprecision(1) << uiMs << L" ms";
+    m_mainCanvas.DrawTextBox(fpsSs.str(), m_mainCanvas.FmtMono(),
+                             D2D1::RectF(fpsPillX + 17.0f * scale, pillY, fpsPillX + 148.0f * scale, pillY + pillH),
+                             HexColor(0xE2E8F0));
+
+    // Мини-график (Sparkline) времени последних 24 кадров UI
+    const auto& hist = m_framePacer.GetHistoryMs();
+    size_t cursor = m_framePacer.GetHistoryCursor();
+    float sparkX = fpsPillX + 150.0f * scale;
+    float sparkW = 48.0f * scale;
+    float sparkBaseY = pillY + pillH - 6.0f * scale;
+    float sparkMaxH = pillH - 12.0f * scale;
+    float barW = sparkW / (float)UiFramePacer::HISTORY_SIZE;
+    float refMs = 1000.0f / (float)std::max(30u, m_framePacer.GetTargetHz());
+    for (size_t i = 0; i < UiFramePacer::HISTORY_SIZE; ++i) {
+        float msVal = hist[(cursor + i) % UiFramePacer::HISTORY_SIZE];
+        float norm = std::clamp(msVal / (refMs * 2.0f), 0.12f, 1.0f);
+        float bh = norm * sparkMaxH;
+        D2D1_COLOR_F bCol = (msVal <= refMs * 1.35f) ? HexColor(0x10B981, 0.85f) : HexColor(0xF59E0B, 0.9f);
+        rt->FillRectangle(D2D1::RectF(sparkX + i * barW, sparkBaseY - bh,
+                                      sparkX + (i + 1) * barW - 0.6f * scale, sparkBaseY),
+                          m_mainCanvas.Brush(bCol));
+    }
+
+    // Плашка Radmin IP слева от счетчика FPS
+    std::string radminIpCopy;
+    {
+        std::lock_guard<std::mutex> lock(m_srvInfoMutex);
+        if (m_radminIp.empty()) m_radminIp = DetectRadminVpnIP();
+        radminIpCopy = m_radminIp;
+    }
+    std::wstringstream ipPillSs;
+    ipPillSs << L"VPN: " << std::wstring(radminIpCopy.begin(), radminIpCopy.end()) << L":" << m_serverPort;
+    float ipPillW = 165.0f * scale;
+    float ipPillX = fpsPillX - 10.0f * scale - ipPillW;
+    if (ipPillX > (float)w * 0.56f) {
+        D2D1_RECT_F ipRect = D2D1::RectF(ipPillX, pillY, ipPillX + ipPillW, pillY + pillH);
+        D2D1_ROUNDED_RECT ipRR = D2D1::RoundedRect(ipRect, 7.0f * scale, 7.0f * scale);
+        rt->FillRoundedRectangle(ipRR, m_mainCanvas.Brush(HexColor(0x131B2B)));
+        rt->DrawRoundedRectangle(ipRR, m_mainCanvas.Brush(HexColor(0x253248)), 1.0f * scale);
+        m_mainCanvas.DrawTextBox(ipPillSs.str(), m_mainCanvas.FmtMono(), ipRect, HexColor(0x93C5FD));
+    }
+
+    // 2. Карточки Хоста и Клиента
+    auto DrawCard = [&](const D2D1_RECT_F& r, float glowT, const D2D1_COLOR_F& glowBorder,
+                        const std::wstring& cardTitle, const std::wstring& badgeText,
+                        const D2D1_COLOR_F& dotCol, const D2D1_COLOR_F& badgeBg,
+                        const D2D1_COLOR_F& badgeBorder, const D2D1_COLOR_F& badgeTxt, float pulseAlpha) {
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(r, 12.0f * scale, 12.0f * scale);
+        rt->FillRoundedRectangle(rr, m_mainCanvas.Brush(HexColor(0x121926)));
+        D2D1_COLOR_F bCol = LerpColor(HexColor(0x222D42), glowBorder, glowT);
+        rt->DrawRoundedRectangle(rr, m_mainCanvas.Brush(bCol), (1.0f + 0.5f * glowT) * scale);
+
+        float hdrBottom = r.top + 42.0f * scale;
+        rt->DrawLine(D2D1::Point2F(r.left + 16.0f * scale, hdrBottom),
+                     D2D1::Point2F(r.right - 16.0f * scale, hdrBottom),
+                     m_mainCanvas.Brush(HexColor(0x1E293B)), 1.0f * scale);
+
+        m_mainCanvas.DrawTextBox(cardTitle, m_mainCanvas.FmtCardTitle(),
+                                 D2D1::RectF(r.left + 18.0f * scale, r.top + 6.0f * scale, r.right - 140.0f * scale, hdrBottom),
+                                 HexColor(0xF1F5F9));
+
+        DrawBadgePill(m_mainCanvas, rt, r.right - 16.0f * scale, r.top + 24.0f * scale,
+                      badgeText, dotCol, badgeBg, badgeBorder, badgeTxt, scale, pulseAlpha);
+    };
+
+    bool srvRun = m_serverRunning.load();
+    bool srvAuth = m_clientAuthorized.load();
+    if (!srvRun) {
+        DrawCard(m_srvCardRect, m_srvCardGlow, HexColor(0x10B981),
+                 L"[1] Режим Хоста (Сервер)", L"Остановлен",
+                 HexColor(0x64748B), HexColor(0x182030), HexColor(0x28344B), HexColor(0x94A3B8), 0.0f);
+    } else if (!srvAuth) {
+        DrawCard(m_srvCardRect, m_srvCardGlow, HexColor(0xF59E0B, 0.7f),
+                 L"[1] Режим Хоста (Сервер)", L"Ожидание · PIN активен",
+                 HexColor(0xF59E0B), HexColor(0x2A1F0D), HexColor(0x784B10), HexColor(0xFCD34D), pulseWave);
+    } else {
+        DrawCard(m_srvCardRect, m_srvCardGlow, HexColor(0x10B981, 0.85f),
+                 L"[1] Режим Хоста (Сервер)", L"Активен · PIN защищён",
+                 HexColor(0x10B981), HexColor(0x0B291E), HexColor(0x065F46), HexColor(0x6EE7B7), pulseWave);
+    }
+
+    bool cliRun = m_clientRunning.load();
+    if (!cliRun) {
+        DrawCard(m_cliCardRect, m_cliCardGlow, HexColor(0x3B82F6),
+                 L"[2] Режим Клиента (Просмотр)", L"Отключен",
+                 HexColor(0x64748B), HexColor(0x182030), HexColor(0x28344B), HexColor(0x94A3B8), 0.0f);
+    } else {
+        DrawCard(m_cliCardRect, m_cliCardGlow, HexColor(0x3B82F6, 0.85f),
+                 L"[2] Режим Клиента (Просмотр)", L"Трансляция активна",
+                 HexColor(0x38BDF8), HexColor(0x0C223B), HexColor(0x0369A1), HexColor(0x7DD3FC), pulseWave);
+    }
+
+    // 3. Рамки полей ввода
+    for (const auto& inp : m_inputFrames) {
+        if (!inp.label.empty()) {
+            m_mainCanvas.DrawTextBox(inp.label, m_mainCanvas.FmtLabel(), inp.labelRect, HexColor(0x94A3B8));
+        }
+        D2D1_ROUNDED_RECT ir = D2D1::RoundedRect(inp.rect, 7.0f * scale, 7.0f * scale);
+        rt->FillRoundedRectangle(ir, m_mainCanvas.Brush(HexColor(0x131824)));
+        D2D1_COLOR_F bCol = LerpColor(HexColor(0x253047), HexColor(0x3B82F6), inp.focusT);
+        rt->DrawRoundedRectangle(ir, m_mainCanvas.Brush(bCol), (1.0f + 0.5f * inp.focusT) * scale);
+    }
+
+    // 4. Рамка списка обнаруженных хостов
+    {
+        D2D1_ROUNDED_RECT lr = D2D1::RoundedRect(m_listFrameRect, 8.0f * scale, 8.0f * scale);
+        rt->FillRoundedRectangle(lr, m_mainCanvas.Brush(HexColor(0x0F141F)));
+        D2D1_COLOR_F lbCol = LerpColor(HexColor(0x232E45), HexColor(0x3B82F6), m_listFocusT);
+        rt->DrawRoundedRectangle(lr, m_mainCanvas.Brush(lbCol), (1.0f + 0.4f * m_listFocusT) * scale);
+    }
+
+    // 5. Плавный переключатель "Сворачивать панель"
+    {
+        const auto& tr = m_autoMinToggle.trackRect;
+        float r = (tr.bottom - tr.top) * 0.5f;
+        D2D1_COLOR_F trackCol = LerpColor(HexColor(0x1E293B), HexColor(0x10B981), m_autoMinToggle.knobT);
+        D2D1_COLOR_F trackBdr = LerpColor(HexColor(0x334155), HexColor(0x34D399, 0.7f), m_autoMinToggle.knobT);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(tr, r, r), m_mainCanvas.Brush(trackCol));
+        rt->DrawRoundedRectangle(D2D1::RoundedRect(tr, r, r), m_mainCanvas.Brush(trackBdr), 1.0f * scale);
+
+        float knobR = r - 3.0f * scale;
+        float minX = tr.left + r;
+        float maxX = tr.right - r;
+        float knobX = minX + (maxX - minX) * m_autoMinToggle.knobT;
+        float knobY = (tr.top + tr.bottom) * 0.5f;
+        rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(knobX, knobY), knobR, knobR),
+                        m_mainCanvas.Brush(HexColor(0xF8FAFC)));
+
+        D2D1_RECT_F lblRect = D2D1::RectF(tr.right + 10.0f * scale, m_autoMinToggle.hitRect.top,
+                                          m_autoMinToggle.hitRect.right, m_autoMinToggle.hitRect.bottom);
+        D2D1_COLOR_F lblCol = LerpColor(HexColor(0x94A3B8), HexColor(0xE2E8F0), m_autoMinToggle.hoverT * 0.7f + m_autoMinToggle.knobT * 0.3f);
+        m_mainCanvas.DrawTextBox(m_autoMinToggle.label, m_mainCanvas.FmtLabel(), lblRect, lblCol);
+    }
+
+    // 6. Кнопки
+    for (const auto& btn : m_buttons) {
+        DrawStyledButton(m_mainCanvas, rt, btn, scale);
+    }
+
+    // 7. Нижние панели телеметрии и статуса файлов
+    std::wstring srvFileStr, cliFileStr;
+    float srvPct = 0.0f, cliPct = 0.0f;
+    {
+        std::lock_guard<std::mutex> lock(m_fileStatusMutex);
+        srvFileStr = m_srvFileStatus;
+        cliFileStr = m_cliFileStatus;
+        srvPct = m_srvFilePct;
+        cliPct = m_cliFilePct;
+    }
+
+    std::string cliIpCopy;
+    {
+        std::lock_guard<std::mutex> lock(m_srvInfoMutex);
+        cliIpCopy = m_connectedClientIp;
+    }
+
+    // Телеметрия сервера
+    {
+        D2D1_ROUNDED_RECT sr = D2D1::RoundedRect(m_srvStatusBoxRect, 8.0f * scale, 8.0f * scale);
+        rt->FillRoundedRectangle(sr, m_mainCanvas.Brush(HexColor(0x0C111B)));
+        rt->DrawRoundedRectangle(sr, m_mainCanvas.Brush(HexColor(0x1C2538)), 1.0f * scale);
+
+        std::wstringstream ss;
+        ss << L"Адрес Radmin VPN: " << std::wstring(radminIpCopy.begin(), radminIpCopy.end()) << L":" << m_serverPort << L"\n";
+        if (!srvRun) {
+            ss << L"Статус: Сервер остановлен (закройте окно без PIN-кода)\n";
+        } else if (!srvAuth) {
+            ss << L"Статус: Ожидание клиента (Discovery UDP:" << DISCOVERY_UDP_PORT << L") · Выход защищён PIN-кодом\n";
+        } else {
+            ss << L"Клиент: " << std::wstring(cliIpCopy.begin(), cliIpCopy.end())
+               << L" | Stream FPS: " << m_srvFps.load()
+               << L" | Enc: " << std::fixed << std::setprecision(1) << (m_srvEncodeUs.load() / 1000.0) << L"ms"
+               << L" | Dec: " << (m_srvClientDecodeUs.load() / 1000.0) << L"ms"
+               << L" | RTT: " << (m_srvRttUs.load() / 1000.0) << L"ms\n";
+        }
+        ss << srvFileStr;
+
+        D2D1_RECT_F tr = D2D1::RectF(m_srvStatusBoxRect.left + 12.0f * scale, m_srvStatusBoxRect.top + 9.0f * scale,
+                                     m_srvStatusBoxRect.right - 12.0f * scale, m_srvStatusBoxRect.bottom - 10.0f * scale);
+        m_mainCanvas.DrawTextBox(ss.str(), m_mainCanvas.FmtBody(), tr, HexColor(0x94A3B8));
+
+        if (m_srvSendingFile.load() && srvPct > 0.0f && srvPct < 1.0f) {
+            float barY = m_srvStatusBoxRect.bottom - 5.0f * scale;
+            float barW = (m_srvStatusBoxRect.right - m_srvStatusBoxRect.left - 24.0f * scale) * srvPct;
+            rt->FillRectangle(D2D1::RectF(m_srvStatusBoxRect.left + 12.0f * scale, barY,
+                                          m_srvStatusBoxRect.left + 12.0f * scale + barW, barY + 2.5f * scale),
+                              m_mainCanvas.Brush(HexColor(0x3B82F6)));
+        }
+    }
+
+    // Телеметрия клиента
+    {
+        D2D1_ROUNDED_RECT cr = D2D1::RoundedRect(m_cliStatusBoxRect, 8.0f * scale, 8.0f * scale);
+        rt->FillRoundedRectangle(cr, m_mainCanvas.Brush(HexColor(0x0C111B)));
+        rt->DrawRoundedRectangle(cr, m_mainCanvas.Brush(HexColor(0x1C2538)), 1.0f * scale);
+
+        std::wstringstream ss;
+        if (!cliRun) {
+            ss << L"Статус: Отключен. Нажмите «Поиск серверов» или введите IP.\n"
+               << L"Подсказка: перетащите файл в окно просмотра для быстрой отправки\n";
+        } else {
+            ss << L"Статус: Трансляция активна (Ctrl+Alt+F — полный экран)\n"
+               << L"Stream FPS: " << m_cliFps.load()
+               << L" | Enc: " << std::fixed << std::setprecision(1) << (m_cliEncodeUs.load() / 1000.0) << L"ms"
+               << L" | Dec: " << (m_cliDecodeUs.load() / 1000.0) << L"ms"
+               << L" | RTT: " << (m_cliRttUs.load() / 1000.0) << L"ms\n";
+        }
+        ss << cliFileStr;
+
+        D2D1_RECT_F tr = D2D1::RectF(m_cliStatusBoxRect.left + 12.0f * scale, m_cliStatusBoxRect.top + 9.0f * scale,
+                                     m_cliStatusBoxRect.right - 12.0f * scale, m_cliStatusBoxRect.bottom - 10.0f * scale);
+        m_mainCanvas.DrawTextBox(ss.str(), m_mainCanvas.FmtBody(), tr, HexColor(0x94A3B8));
+
+        if (m_cliSendingFile.load() && cliPct > 0.0f && cliPct < 1.0f) {
+            float barY = m_cliStatusBoxRect.bottom - 5.0f * scale;
+            float barW = (m_cliStatusBoxRect.right - m_cliStatusBoxRect.left - 24.0f * scale) * cliPct;
+            rt->FillRectangle(D2D1::RectF(m_cliStatusBoxRect.left + 12.0f * scale, barY,
+                                          m_cliStatusBoxRect.left + 12.0f * scale + barW, barY + 2.5f * scale),
+                              m_mainCanvas.Brush(HexColor(0x3B82F6)));
+        }
+    }
+
+    m_mainCanvas.EndFrameAndBlit(hdc, w, h);
+    EndPaint(hwnd, &ps);
+}
+
+void RemoteDesktopApp::PaintModalWindow(HWND hwnd) {
+    PAINTSTRUCT ps = {};
+    HDC hdc = BeginPaint(hwnd, &ps);
+
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    uint32_t w = (uint32_t)std::max<LONG>(1, rc.right - rc.left);
+    uint32_t h = (uint32_t)std::max<LONG>(1, rc.bottom - rc.top);
+
+    ID2D1DCRenderTarget* rt = nullptr;
+    if (!m_modal.canvas.BeginFrame(hwnd, w, h, &rt)) {
+        EndPaint(hwnd, &ps);
+        return;
+    }
+
+    UINT dpi = GetDpiForWindow(hwnd);
+    float scale = (float)dpi / 96.0f;
+    bool isConfirm = (m_modal.mode == ModalPinMode::ConfirmExitHostSession);
+
+    rt->Clear(HexColor(0x111723));
+    D2D1_RECT_F outer = D2D1::RectF(0.5f, 0.5f, (float)w - 0.5f, (float)h - 0.5f);
+    rt->DrawRectangle(outer, m_modal.canvas.Brush(HexColor(0x2B3852)), 1.0f * scale);
+
+    // Верхняя акцентная полоса
+    D2D1_COLOR_F accent = isConfirm ? HexColor(0xEF4444) : HexColor(0x10B981);
+    rt->FillRectangle(D2D1::RectF(0.0f, 0.0f, (float)w, 3.5f * scale), m_modal.canvas.Brush(accent));
+
+    // Значок щита/замка
+    float pad = 22.0f * scale;
+    float iconSize = 32.0f * scale;
+    D2D1_ROUNDED_RECT iconBox = D2D1::RoundedRect(D2D1::RectF(pad, 20.0f * scale, pad + iconSize, 20.0f * scale + iconSize),
+                                                  8.0f * scale, 8.0f * scale);
+    D2D1_COLOR_F iconBg = isConfirm ? HexColor(0xEF4444, 0.16f) : HexColor(0x10B981, 0.16f);
+    rt->FillRoundedRectangle(iconBox, m_modal.canvas.Brush(iconBg));
+    rt->DrawRoundedRectangle(iconBox, m_modal.canvas.Brush(accent), 1.1f * scale);
+
+    // Простой векторный символ замка внутри иконки
+    float lx = pad + iconSize * 0.5f;
+    float ly = 20.0f * scale + iconSize * 0.54f;
+    rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(lx - 5.5f * scale, ly - 3.0f * scale, lx + 5.5f * scale, ly + 5.5f * scale),
+                                               1.8f * scale, 1.8f * scale),
+                             m_modal.canvas.Brush(accent), 1.6f * scale);
+    rt->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(lx, ly - 5.0f * scale), 3.2f * scale, 3.5f * scale),
+                    m_modal.canvas.Brush(accent), 1.5f * scale);
+
+    std::wstring title = isConfirm
+        ? L"Подтверждение выхода из хост-сессии"
+        : L"PIN-код защиты активной сессии";
+    std::wstring subtitle = isConfirm
+        ? L"Хост-сессия активна. Введите заданный при запуске PIN-код, чтобы остановить сервер и выйти (Esc — отмена):"
+        : L"Задайте временный PIN-код (хранится только в ОЗУ на время этой сессии). Он потребуется для выхода из программы:";
+
+    m_modal.canvas.DrawTextBox(title, m_modal.canvas.FmtCardTitle(),
+                               D2D1::RectF(pad + iconSize + 12.0f * scale, 18.0f * scale, (float)w - pad, 52.0f * scale),
+                               HexColor(0xF8FAFC));
+    m_modal.canvas.DrawTextBox(subtitle, m_modal.canvas.FmtBody(),
+                               D2D1::RectF(pad, 62.0f * scale, (float)w - pad, 108.0f * scale),
+                               HexColor(0x94A3B8));
+
+    // Сдвиг рамки поля ввода при ошибке (shake-анимация)
+    float shakeX = 0.0f;
+    if (m_modal.shakeTimer > 0.0f) {
+        shakeX = std::sin(m_modal.shakeTimer * 52.0f) * 6.0f * scale * (m_modal.shakeTimer / 0.35f);
+    }
+
+    D2D1_RECT_F er = m_modal.editFrameRect;
+    er.left += shakeX; er.right += shakeX;
+    D2D1_ROUNDED_RECT editRR = D2D1::RoundedRect(er, 8.0f * scale, 8.0f * scale);
+    rt->FillRoundedRectangle(editRR, m_modal.canvas.Brush(HexColor(0x161D2C)));
+    bool hasErr = !m_modal.errorText.empty();
+    D2D1_COLOR_F editBorder = hasErr ? HexColor(0xEF4444) : HexColor(0x3B82F6);
+    rt->DrawRoundedRectangle(editRR, m_modal.canvas.Brush(editBorder), 1.4f * scale);
+
+    if (hasErr) {
+        m_modal.canvas.DrawTextBox(m_modal.errorText, m_modal.canvas.FmtLabel(),
+                                   D2D1::RectF(pad, er.bottom + 6.0f * scale, (float)w - pad, er.bottom + 28.0f * scale),
+                                   HexColor(0xF87171));
+    }
+
+    for (const auto& mb : m_modal.buttons) {
+        DrawStyledButton(m_modal.canvas, rt, mb, scale);
+    }
+
+    m_modal.canvas.EndFrameAndBlit(hdc, w, h);
+    EndPaint(hwnd, &ps);
+}
+
+// ============================================================================
+// ПРОЦЕДУРЫ ОКОН И МОДАЛЬНОГО ДИАЛОГА PIN
+// ============================================================================
+LRESULT CALLBACK ModalPinWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto SubmitModal = []() {
+        if (!g_app.m_modal.hwndEdit) return;
+        wchar_t pinBuf[128] = {};
+        int len = GetWindowTextW(g_app.m_modal.hwndEdit, pinBuf, (int)_countof(pinBuf));
+
+        if (g_app.m_modal.mode == ModalPinMode::SetHostSessionPin) {
+            if (len < 1) {
+                g_app.m_modal.errorText = L"Введите непустой PIN-код или парольную фразу!";
+                g_app.m_modal.shakeTimer = 0.35f;
+                SetFocus(g_app.m_modal.hwndEdit);
+                SecureZeroMemory(pinBuf, sizeof(pinBuf));
+                return;
+            }
+            if (!g_app.SetRuntimeSessionPin(pinBuf, (size_t)len)) {
+                g_app.m_modal.errorText = L"Ошибка инициализации криптографии!";
+                g_app.m_modal.shakeTimer = 0.35f;
+                SecureZeroMemory(pinBuf, sizeof(pinBuf));
+                return;
+            }
+            SecureZeroMemory(pinBuf, sizeof(pinBuf));
+            g_app.m_modal.confirmed = true;
+            g_app.m_modal.active = false;
+        } else {
+            if (len < 1 || !g_app.VerifyRuntimeSessionPin(pinBuf, (size_t)len)) {
+                g_app.m_modal.errorText = L"Неверный PIN-код сессии. Попробуйте ещё раз или нажмите Esc.";
+                g_app.m_modal.shakeTimer = 0.35f;
+                SetWindowTextW(g_app.m_modal.hwndEdit, L"");
+                SetFocus(g_app.m_modal.hwndEdit);
+                SecureZeroMemory(pinBuf, sizeof(pinBuf));
+                return;
+            }
+            SecureZeroMemory(pinBuf, sizeof(pinBuf));
+            g_app.m_modal.confirmed = true;
+            g_app.m_modal.active = false;
+        }
+    };
+
+    switch (msg) {
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, RGB(241, 245, 249));
+        SetBkColor(hdc, RGB(22, 29, 44));
+        static HBRUSH s_modalEditBrush = CreateSolidBrush(RGB(22, 29, 44));
+        return (LRESULT)s_modalEditBrush;
+    }
+
+    case WM_NCHITTEST: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ScreenToClient(hwnd, &pt);
+        for (const auto& b : g_app.m_modal.buttons) {
+            if (pt.x >= b.rect.left && pt.x <= b.rect.right && pt.y >= b.rect.top && pt.y <= b.rect.bottom) {
+                return HTCLIENT;
+            }
+        }
+        if (pt.x >= g_app.m_modal.editFrameRect.left && pt.x <= g_app.m_modal.editFrameRect.right &&
+            pt.y >= g_app.m_modal.editFrameRect.top  && pt.y <= g_app.m_modal.editFrameRect.bottom) {
+            return HTCLIENT;
+        }
+        if (pt.y < 60) return HTCAPTION;
+        return HTCLIENT;
+    }
+
+    case WM_PAINT:
+        g_app.PaintModalWindow(hwnd);
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEMOVE: {
+        if (!g_app.m_modal.trackingMouse) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+            g_app.m_modal.trackingMouse = true;
+        }
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int hit = -1;
+        for (const auto& b : g_app.m_modal.buttons) {
+            if (pt.x >= b.rect.left && pt.x <= b.rect.right && pt.y >= b.rect.top && pt.y <= b.rect.bottom) {
+                hit = b.id;
+                break;
+            }
+        }
+        g_app.m_modal.hoveredBtnId = hit;
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        g_app.m_modal.trackingMouse = false;
+        g_app.m_modal.hoveredBtnId = -1;
+        return 0;
+
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int hit = -1;
+        for (const auto& b : g_app.m_modal.buttons) {
+            if (pt.x >= b.rect.left && pt.x <= b.rect.right && pt.y >= b.rect.top && pt.y <= b.rect.bottom) {
+                hit = b.id;
+                break;
+            }
+        }
+        if (hit != -1) {
+            g_app.m_modal.pressedBtnId = hit;
+            SetCapture(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (GetCapture() == hwnd) ReleaseCapture();
+        int pressed = g_app.m_modal.pressedBtnId;
+        g_app.m_modal.pressedBtnId = -1;
+        if (pressed != -1 && pressed == g_app.m_modal.hoveredBtnId) {
+            if (pressed == IDC_MODAL_BTN_OK) {
+                SubmitModal();
+            } else if (pressed == IDC_MODAL_BTN_CANCEL) {
+                g_app.m_modal.confirmed = false;
+                g_app.m_modal.active = false;
+            } else if (pressed == IDC_MODAL_BTN_EYE) {
+                g_app.m_modal.showPassword = !g_app.m_modal.showPassword;
+                g_app.m_modal.buttons[2].text = g_app.m_modal.showPassword ? L"Скрыть" : L"Показать";
+                SendMessageW(g_app.m_modal.hwndEdit, EM_SETPASSWORDCHAR,
+                             g_app.m_modal.showPassword ? 0 : L'\x25CF', 0);
+                InvalidateRect(g_app.m_modal.hwndEdit, nullptr, TRUE);
+                SetFocus(g_app.m_modal.hwndEdit);
+            }
+        }
+        return 0;
+    }
+
+    case WM_CAPTURECHANGED:
+        g_app.m_modal.pressedBtnId = -1;
+        return 0;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_MODAL_EDIT_PIN && HIWORD(wParam) == EN_CHANGE) {
+            g_app.m_modal.errorText.clear();
+        }
+        return 0;
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            g_app.m_modal.confirmed = false;
+            g_app.m_modal.active = false;
+            return 0;
+        } else if (wParam == VK_RETURN) {
+            SubmitModal();
+            return 0;
+        }
+        return 0;
+
+    case WM_CLOSE:
+        g_app.m_modal.confirmed = false;
+        g_app.m_modal.active = false;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+bool RemoteDesktopApp::RunPinModalDialog(ModalPinMode mode) {
+    if (m_modal.active) return false;
+    if (!IsWindowVisible(m_hwndMain) || IsIconic(m_hwndMain)) {
+        RestoreFromTray();
+    }
+
+    UINT dpi = GetDpiForWindow(m_hwndMain);
+    auto S = [&](int v) { return (float)MulDiv(v, dpi, 96); };
+    auto Si = [&](int v) { return MulDiv(v, dpi, 96); };
+
+    int dlgW = Si(456);
+    int dlgH = Si(236);
+
+    RECT ownerRc = {};
+    GetWindowRect(m_hwndMain, &ownerRc);
+    int posX = ownerRc.left + ((ownerRc.right - ownerRc.left) - dlgW) / 2;
+    int posY = ownerRc.top  + ((ownerRc.bottom - ownerRc.top) - dlgH) / 2;
+
+    m_modal.mode = mode;
+    m_modal.errorText.clear();
+    m_modal.shakeTimer = 0.0f;
+    m_modal.showPassword = false;
+    m_modal.confirmed = false;
+    m_modal.hoveredBtnId = -1;
+    m_modal.pressedBtnId = -1;
+    m_modal.trackingMouse = false;
+
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    HWND hDlg = CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        L"RadminUltraRD_PinModal",
+        (mode == ModalPinMode::ConfirmExitHostSession) ? L"Подтверждение выхода" : L"PIN-код сессии",
+        WS_POPUP | WS_CLIPCHILDREN,
+        posX, posY, dlgW, dlgH,
+        m_hwndMain, nullptr, hInst, nullptr);
+    if (!hDlg) return false;
+
+    ApplyWindowDarkChrome(hDlg, true);
+    m_modal.hwnd = hDlg;
+
+    float pad = S(22);
+    float eyeW = S(86);
+    float editTop = S(116);
+    float editH = S(36);
+    float editW = (float)dlgW - pad * 2.0f - eyeW - S(8);
+    m_modal.editFrameRect = D2D1::RectF(pad, editTop, pad + editW, editTop + editH);
+
+    int insetX = Si(10), insetY = Si(8);
+    m_modal.hwndEdit = CreateWindowExW(
+        0, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_PASSWORD | ES_AUTOHSCROLL,
+        (int)pad + insetX, (int)editTop + insetY,
+        std::max(20, (int)editW - insetX * 2), std::max(16, (int)editH - insetY * 2),
+        hDlg, (HMENU)(INT_PTR)IDC_MODAL_EDIT_PIN, hInst, nullptr);
+    SendMessageW(m_modal.hwndEdit, WM_SETFONT, (WPARAM)m_hEditFont, TRUE);
+    SendMessageW(m_modal.hwndEdit, EM_LIMITTEXT, 64, 0);
+    SendMessageW(m_modal.hwndEdit, EM_SETPASSWORDCHAR, L'\x25CF', 0);
+
+    float btnY = (float)dlgH - S(54);
+    float btnH = S(34);
+    float okW = (mode == ModalPinMode::ConfirmExitHostSession) ? S(162) : S(138);
+    float cancelW = S(112);
+
+    m_modal.buttons[0] = {
+        IDC_MODAL_BTN_OK,
+        D2D1::RectF((float)dlgW - pad - okW, btnY, (float)dlgW - pad, btnY + btnH),
+        (mode == ModalPinMode::ConfirmExitHostSession) ? L"Остановить и выйти" : L"Запустить хост",
+        (mode == ModalPinMode::ConfirmExitHostSession) ? BTN_VAR_DANGER : BTN_VAR_PRIMARY_GREEN,
+        true
+    };
+    m_modal.buttons[1] = {
+        IDC_MODAL_BTN_CANCEL,
+        D2D1::RectF((float)dlgW - pad - okW - S(10) - cancelW, btnY, (float)dlgW - pad - okW - S(10), btnY + btnH),
+        L"Отмена (Esc)",
+        BTN_VAR_SECONDARY,
+        true
+    };
+    m_modal.buttons[2] = {
+        IDC_MODAL_BTN_EYE,
+        D2D1::RectF(pad + editW + S(8), editTop, (float)dlgW - pad, editTop + editH),
+        L"Показать",
+        BTN_VAR_SECONDARY,
+        true
+    };
+
+    m_modal.canvas.UpdateFontsForDpi(dpi);
+    m_modal.active = true;
+
+    EnableWindow(m_hwndMain, FALSE);
+    ShowWindow(hDlg, SW_SHOW);
+    SetForegroundWindow(hDlg);
+    SetFocus(m_modal.hwndEdit);
+    m_framePacer.ResetTiming();
+
+    MSG msg = {};
+    while (m_modal.active) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                PostQuitMessage((int)msg.wParam);
+                m_modal.confirmed = false;
+                m_modal.active = false;
+                break;
+            }
+            if ((msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) &&
+                (msg.wParam == VK_ESCAPE || msg.wParam == VK_RETURN)) {
+                SendMessageW(hDlg, msg.message, msg.wParam, msg.lParam);
+                continue;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        if (!m_modal.active) break;
+
+        float dt = 0.0f;
+        if (m_framePacer.WaitOrCheckFrameReady(true, dt)) {
+            TickAndRenderUi(dt);
+        }
+    }
+
+    if (IsWindow(m_modal.hwndEdit)) {
+        SetWindowTextW(m_modal.hwndEdit, L"");
+        SendMessageW(m_modal.hwndEdit, EM_EMPTYUNDOBUFFER, 0, 0);
+    }
+    EnableWindow(m_hwndMain, TRUE);
+    DestroyWindow(hDlg);
+    m_modal.canvas.Destroy();
+    m_modal.hwnd = nullptr;
+    m_modal.hwndEdit = nullptr;
+    SetForegroundWindow(m_hwndMain);
+    m_framePacer.ResetTiming();
+    return m_modal.confirmed;
+}
+
+void RemoteDesktopApp::HandleCloseRequest() {
+    if (m_modal.active) return;
+
+    if (m_serverRunning.load()) {
+        if (RunPinModalDialog(ModalPinMode::ConfirmExitHostSession)) {
+            StopServer();
+            DestroyWindow(m_hwndMain);
+        }
+    } else {
+        DestroyWindow(m_hwndMain);
+    }
+}
 
 // ============================================================================
 // ХУК КЛАВИШИ WINDOWS И ОКОННЫЕ ПРОЦЕДУРЫ WIN32
@@ -3025,64 +4534,191 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     switch (msg) {
     case WM_CREATE: {
         g_app.m_hwndMain = hwnd;
+        ApplyWindowDarkChrome(hwnd, false);
+
+        g_app.m_hDarkInputBrush = CreateSolidBrush(RGB(19, 24, 36));
+        g_app.m_hDarkListBrush  = CreateSolidBrush(RGB(15, 20, 31));
+
         HINSTANCE hInst = GetModuleHandleW(nullptr);
         auto MakeCtrl = [&](LPCWSTR cls, LPCWSTR txt, DWORD style, int id) {
             return CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | style,
                                    0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)id, hInst, nullptr);
         };
 
-        // --- БЛОК 1: СЕРВЕР ---
-        g_app.m_grpServer = MakeCtrl(L"BUTTON", L"[1] Создать сервер (Режим Хоста)", BS_GROUPBOX, IDC_GRP_SERVER);
-
         char compName[64] = "Radmin-PC";
         DWORD compLen = sizeof(compName);
         GetComputerNameA(compName, &compLen);
         std::wstring wCompName(compName, compName + strlen(compName));
 
-        g_app.m_lblSrvName     = MakeCtrl(L"STATIC", L"Имя машины / сервера:", 0, IDC_LBL_SRV_NAME);
-        g_app.m_editSrvName    = MakeCtrl(L"EDIT", wCompName.c_str(), WS_BORDER | ES_AUTOHSCROLL, IDC_EDIT_SRV_NAME);
-        g_app.m_lblSrvPass     = MakeCtrl(L"STATIC", L"Пароль доступа:", 0, IDC_LBL_SRV_PASS);
-        g_app.m_editSrvPass    = MakeCtrl(L"EDIT", L"12345", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, IDC_EDIT_SRV_PASS);
-        g_app.m_lblSrvPort     = MakeCtrl(L"STATIC", L"Порт (TCP + UDP):", 0, IDC_LBL_SRV_PORT);
-        g_app.m_editSrvPort    = MakeCtrl(L"EDIT", L"27000", WS_BORDER | ES_NUMBER, IDC_EDIT_SRV_PORT);
-        g_app.m_chkAutoMin     = MakeCtrl(L"BUTTON", L"Сворачивать панель при подключении клиента", BS_AUTOCHECKBOX, IDC_CHK_AUTO_MIN);
-        g_app.m_btnSrvToggle   = MakeCtrl(L"BUTTON", L"Запустить сервер", BS_PUSHBUTTON, IDC_BTN_SRV_TOGGLE);
-        g_app.m_btnSrvTray     = MakeCtrl(L"BUTTON", L"Свернуть в трей", BS_PUSHBUTTON, IDC_BTN_SRV_TRAY);
-        g_app.m_btnSrvSendFile = MakeCtrl(L"BUTTON", L"Отправить файл клиенту...", BS_PUSHBUTTON, IDC_BTN_SRV_SENDFILE);
-        g_app.m_lblSrvStatus   = MakeCtrl(L"STATIC", L"", SS_LEFT, IDC_LBL_SRV_STATUS);
+        g_app.m_editSrvName = MakeCtrl(L"EDIT", wCompName.c_str(), ES_AUTOHSCROLL, IDC_EDIT_SRV_NAME);
+        g_app.m_editSrvPass = MakeCtrl(L"EDIT", L"12345", ES_PASSWORD | ES_AUTOHSCROLL, IDC_EDIT_SRV_PASS);
+        g_app.m_editSrvPort = MakeCtrl(L"EDIT", L"27000", ES_NUMBER, IDC_EDIT_SRV_PORT);
 
-        // --- БЛОК 2: КЛИЕНТ ---
-        g_app.m_grpClient      = MakeCtrl(L"BUTTON", L"[2] Подключиться к ПК (Режим Клиента)", BS_GROUPBOX, IDC_GRP_CLIENT);
-        g_app.m_btnCliScan     = MakeCtrl(L"BUTTON", L"Поиск серверов в сети Radmin VPN", BS_PUSHBUTTON, IDC_BTN_CLI_SCAN);
-        g_app.m_listHosts      = MakeCtrl(L"LISTBOX", L"", WS_BORDER | WS_VSCROLL | LBS_NOTIFY, IDC_LIST_HOSTS);
-        g_app.m_lblCliIp       = MakeCtrl(L"STATIC", L"IP и порт хоста:", 0, IDC_LBL_CLI_IP);
-        g_app.m_editCliIp      = MakeCtrl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, IDC_EDIT_CLI_IP);
-        g_app.m_editCliPort    = MakeCtrl(L"EDIT", L"27000", WS_BORDER | ES_NUMBER, IDC_EDIT_CLI_PORT);
-        g_app.m_lblCliPass     = MakeCtrl(L"STATIC", L"Пароль сервера:", 0, IDC_LBL_CLI_PASS);
-        g_app.m_editCliPass    = MakeCtrl(L"EDIT", L"12345", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, IDC_EDIT_CLI_PASS);
-        g_app.m_btnCliConnect  = MakeCtrl(L"BUTTON", L"Подключиться", BS_PUSHBUTTON, IDC_BTN_CLI_CONNECT);
-        g_app.m_btnCliSendFile = MakeCtrl(L"BUTTON", L"Отправить файл...", BS_PUSHBUTTON, IDC_BTN_CLI_SENDFILE);
-        g_app.m_lblCliStatus   = MakeCtrl(L"STATIC", L"", SS_LEFT, IDC_LBL_CLI_STATUS);
+        g_app.m_listHosts   = MakeCtrl(L"LISTBOX", L"", WS_VSCROLL | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT, IDC_LIST_HOSTS);
+        ApplyDarkScrollbarTheme(g_app.m_listHosts);
 
+        g_app.m_editCliIp   = MakeCtrl(L"EDIT", L"", ES_AUTOHSCROLL, IDC_EDIT_CLI_IP);
+        g_app.m_editCliPort = MakeCtrl(L"EDIT", L"27000", ES_NUMBER, IDC_EDIT_CLI_PORT);
+        g_app.m_editCliPass = MakeCtrl(L"EDIT", L"12345", ES_PASSWORD | ES_AUTOHSCROLL, IDC_EDIT_CLI_PASS);
+
+        g_app.InitCanvasWidgets();
         g_app.UpdateFontsForDpi(GetDpiForWindow(hwnd));
         g_app.RelayoutMainWindow();
         g_app.ShowInTray(false);
 
         AddClipboardFormatListener(hwnd);
-        g_app.UpdateStatusLabels();
         return 0;
     }
 
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
         UINT dpi = GetDpiForWindow(hwnd);
-        mmi->ptMinTrackSize.x = MulDiv(760, dpi, 96);
-        mmi->ptMinTrackSize.y = MulDiv(410, dpi, 96);
+        mmi->ptMinTrackSize.x = MulDiv(820, dpi, 96);
+        m_min_h:
+        mmi->ptMinTrackSize.y = MulDiv(480, dpi, 96);
         return 0;
     }
 
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, RGB(241, 245, 249));
+        SetBkColor(hdc, RGB(19, 24, 36));
+        return (LRESULT)g_app.m_hDarkInputBrush;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        // Read-only EDIT controls send WM_CTLCOLORSTATIC instead of WM_CTLCOLOREDIT
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, RGB(148, 163, 184));
+        SetBkColor(hdc, RGB(19, 24, 36));
+        return (LRESULT)g_app.m_hDarkInputBrush;
+    }
+
+    case WM_CTLCOLORLISTBOX: {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, RGB(226, 232, 240));
+        SetBkColor(hdc, RGB(15, 20, 31));
+        return (LRESULT)g_app.m_hDarkListBrush;
+    }
+
+    case WM_MEASUREITEM: {
+        auto* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+        if (mis->CtlID == IDC_LIST_HOSTS) {
+            mis->itemHeight = MulDiv(28, GetDpiForWindow(hwnd), 96);
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_DRAWITEM: {
+        auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (dis->CtlID == IDC_LIST_HOSTS) {
+            HDC hdc = dis->hDC;
+            RECT r = dis->rcItem;
+            bool selected = (dis->itemState & ODS_SELECTED) != 0;
+
+            HBRUSH bgBrush = CreateSolidBrush(selected ? RGB(30, 58, 118) : RGB(15, 20, 31));
+            FillRect(hdc, &r, bgBrush);
+            DeleteObject(bgBrush);
+
+            if (dis->itemID != (UINT)-1) {
+                LRESULT len = SendMessageW(g_app.m_listHosts, LB_GETTEXTLEN, dis->itemID, 0);
+                if (len > 0 && len < 512) {
+                    std::wstring itemText((size_t)len, L'\0');
+                    SendMessageW(g_app.m_listHosts, LB_GETTEXT, dis->itemID, (LPARAM)itemText.data());
+
+                    if (selected) {
+                        HBRUSH barBrush = CreateSolidBrush(RGB(59, 130, 246));
+                        RECT bar = { r.left + 2, r.top + 4, r.left + 5, r.bottom - 4 };
+                        FillRect(hdc, &bar, barBrush);
+                        DeleteObject(barBrush);
+                    }
+
+                    SetBkMode(hdc, TRANSPARENT);
+                    SetTextColor(hdc, selected ? RGB(248, 250, 252) : RGB(203, 213, 225));
+                    HGDIOBJ oldFont = SelectObject(hdc, selected ? g_app.m_hListFontBold : g_app.m_hListFont);
+                    RECT txtRc = { r.left + 12, r.top, r.right - 8, r.bottom };
+                    DrawTextW(hdc, itemText.c_str(), (int)itemText.size(), &txtRc,
+                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                    SelectObject(hdc, oldFont);
+                }
+            }
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_PAINT:
+        g_app.PaintMainWindow(hwnd);
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEMOVE: {
+        if (!g_app.m_trackingMouse) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+            g_app.m_trackingMouse = true;
+        }
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        g_app.m_hoveredBtnId = g_app.HitTestMainButton(pt);
+        g_app.m_hoveredToggle = (g_app.m_hoveredBtnId == -1) && g_app.HitTestAutoMinToggle(pt);
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        g_app.m_trackingMouse = false;
+        g_app.m_hoveredBtnId = -1;
+        g_app.m_hoveredToggle = false;
+        return 0;
+
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        int hit = g_app.HitTestMainButton(pt);
+        if (hit != -1) {
+            g_app.m_pressedBtnId = hit;
+            SetCapture(hwnd);
+            return 0;
+        }
+        if (g_app.HitTestAutoMinToggle(pt)) {
+            g_app.m_pressedToggle = true;
+            SetCapture(hwnd);
+            return 0;
+        }
+        SetFocus(hwnd);
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (GetCapture() == hwnd) ReleaseCapture();
+        int pressedBtn = g_app.m_pressedBtnId;
+        bool pressedTgl = g_app.m_pressedToggle;
+        g_app.m_pressedBtnId = -1;
+        g_app.m_pressedToggle = false;
+
+        if (pressedBtn != -1 && pressedBtn == g_app.m_hoveredBtnId) {
+            g_app.OnMainCanvasButtonClick(pressedBtn);
+        } else if (pressedTgl && g_app.m_hoveredToggle) {
+            g_app.m_autoMinToggle.checked = !g_app.m_autoMinToggle.checked;
+            g_app.m_autoMinimize = g_app.m_autoMinToggle.checked;
+        }
+        return 0;
+    }
+
+    case WM_CAPTURECHANGED:
+        g_app.m_pressedBtnId = -1;
+        g_app.m_pressedToggle = false;
+        return 0;
+
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) g_app.RelayoutMainWindow();
+        return 0;
+
+    case WM_EXITSIZEMOVE:
+    case WM_DISPLAYCHANGE:
+        g_app.m_framePacer.RefreshTargetHz();
+        g_app.m_framePacer.ResetTiming();
         return 0;
 
     case WM_DPICHANGED: {
@@ -3092,6 +4728,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                      suggested->right - suggested->left, suggested->bottom - suggested->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
         g_app.RelayoutMainWindow();
+        g_app.m_framePacer.ResetTiming();
         return 0;
     }
 
@@ -3115,23 +4752,13 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_COMMAND: {
         int id = LOWORD(wParam), code = HIWORD(wParam);
-        if (id == IDC_BTN_SRV_TOGGLE && code == BN_CLICKED) {
-            if (!g_app.m_serverRunning) g_app.StartServer(); else g_app.StopServer();
-        } else if (id == IDC_BTN_SRV_TRAY && code == BN_CLICKED) {
-            g_app.ShowInTray(true);
-        } else if (id == IDC_BTN_SRV_SENDFILE && code == BN_CLICKED) {
-            g_app.PromptAndSendFile(true);
-        } else if (id == IDC_BTN_CLI_SENDFILE && code == BN_CLICKED) {
-            g_app.PromptAndSendFile(false);
-        } else if (id == IDM_TRAY_RESTORE) {
+        if (id == IDM_TRAY_RESTORE) {
             g_app.RestoreFromTray();
         } else if (id == IDM_TRAY_STOP_SRV) {
             g_app.StopServer();
             g_app.RestoreFromTray();
         } else if (id == IDM_TRAY_EXIT) {
-            DestroyWindow(hwnd);
-        } else if (id == IDC_BTN_CLI_SCAN && code == BN_CLICKED) {
-            g_app.ScanNetworkForServers();
+            g_app.HandleCloseRequest();
         } else if (id == IDC_LIST_HOSTS && code == LBN_SELCHANGE) {
             int sel = (int)SendMessageW(g_app.m_listHosts, LB_GETCURSEL, 0, 0);
             std::lock_guard<std::mutex> lock(g_app.m_hostsMutex);
@@ -3139,8 +4766,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 SetWindowTextA(g_app.m_editCliIp, g_app.m_discoveredHosts[sel].ip.c_str());
                 SetWindowTextA(g_app.m_editCliPort, std::to_string(g_app.m_discoveredHosts[sel].port).c_str());
             }
-        } else if (id == IDC_BTN_CLI_CONNECT && code == BN_CLICKED) {
-            if (!g_app.m_clientRunning) g_app.ConnectToServer(); else g_app.DisconnectClient();
+        } else if (id == IDC_LIST_HOSTS && code == LBN_DBLCLK) {
+            if (!g_app.m_clientRunning) g_app.ConnectToServer();
         }
         return 0;
     }
@@ -3150,7 +4777,11 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_APP_UPDATE_UI:
-        g_app.UpdateStatusLabels();
+        g_app.RefreshButtonVisualStates();
+        return 0;
+
+    case WM_APP_AUTO_MINIMIZE:
+        ShowWindow(hwnd, SW_MINIMIZE);
         return 0;
 
     case WM_APP_CLIENT_LOST:
@@ -3162,7 +4793,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         std::lock_guard<std::mutex> lock(g_app.m_hostsMutex);
         for (const auto& h : g_app.m_discoveredHosts) {
             std::ostringstream oss;
-            oss << h.name << " [" << h.ip << ":" << h.port << "] (" << h.width << "x" << h.height << ")";
+            oss << h.name << "  [" << h.ip << ":" << h.port << "]  (" << h.width << "x" << h.height << ")";
             std::string s = oss.str();
             std::wstring ws(s.begin(), s.end());
             SendMessageW(g_app.m_listHosts, LB_ADDSTRING, 0, (LPARAM)ws.c_str());
@@ -3175,12 +4806,15 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
-    case WM_CLOSE:
-        if (g_app.m_serverRunning && g_app.m_clientAuthorized) {
-            ShowWindow(hwnd, SW_MINIMIZE);
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) == SC_CLOSE) {
+            g_app.HandleCloseRequest();
             return 0;
         }
-        DestroyWindow(hwnd);
+        break;
+
+    case WM_CLOSE:
+        g_app.HandleCloseRequest();
         return 0;
 
     case WM_DESTROY:
@@ -3188,8 +4822,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         g_app.RemoveTrayIcon();
         g_app.DisconnectClient();
         g_app.StopServer();
-        if (g_app.m_hFont) DeleteObject(g_app.m_hFont);
-        if (g_app.m_hFontBold) DeleteObject(g_app.m_hFontBold);
+        g_app.m_mainCanvas.Destroy();
+        if (g_app.m_hEditFont) DeleteObject(g_app.m_hEditFont);
+        if (g_app.m_hListFont) DeleteObject(g_app.m_hListFont);
+        if (g_app.m_hListFontBold) DeleteObject(g_app.m_hListFontBold);
+        if (g_app.m_hDarkInputBrush) DeleteObject(g_app.m_hDarkInputBrush);
+        if (g_app.m_hDarkListBrush)  DeleteObject(g_app.m_hDarkListBrush);
         PostQuitMessage(0);
         return 0;
     }
@@ -3211,9 +4849,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     wcMain.hInstance = hInstance;
     wcMain.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wcMain.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wcMain.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wcMain.hbrBackground = nullptr;
     wcMain.lpszClassName = L"RadminUltraRD_Main";
     RegisterClassExW(&wcMain);
+
+    WNDCLASSEXW wcModal = { sizeof(WNDCLASSEXW) };
+    wcModal.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;
+    wcModal.lpfnWndProc = ModalPinWndProc;
+    wcModal.hInstance = hInstance;
+    wcModal.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcModal.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcModal.hbrBackground = nullptr;
+    wcModal.lpszClassName = L"RadminUltraRD_PinModal";
+    RegisterClassExW(&wcModal);
 
     WNDCLASSEXW wcViewer = { sizeof(WNDCLASSEXW) };
     wcViewer.style = CS_HREDRAW | CS_VREDRAW;
@@ -3231,8 +4879,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     int screenH = workArea.bottom - workArea.top;
 
     UINT dpi = GetDpiForSystem();
-    int initW = std::min(screenW - 40, MulDiv(900, dpi, 96));
-    int initH = std::min(screenH - 40, MulDiv(450, dpi, 96));
+    int initW = std::min(screenW - 40, MulDiv(980, dpi, 96));
+    int initH = std::min(screenH - 40, MulDiv(540, dpi, 96));
     int initX = workArea.left + (screenW - initW) / 2;
     int initY = workArea.top + (screenH - initH) / 2;
 
@@ -3244,20 +4892,54 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     HWND hwndMain = CreateWindowExW(
         0, L"RadminUltraRD_Main",
-        L"Radmin VPN Ultra-Low Latency Remote Desktop (DXGI + H.264 Zero-Latency + UDP + File Transfer)",
+        L"Radmin Ultra RD — Remote Desktop & File Transfer",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         initX, initY, initW, initH,
         nullptr, nullptr, hInstance, nullptr);
 
     g_app.m_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);
+    g_app.m_framePacer.Initialize();
 
     ShowWindow(hwndMain, nCmdShow);
     UpdateWindow(hwndMain);
 
+    HWND tabOrder[] = {
+        g_app.m_editSrvName, g_app.m_editSrvPass, g_app.m_editSrvPort,
+        g_app.m_listHosts, g_app.m_editCliIp, g_app.m_editCliPort, g_app.m_editCliPass
+    };
+
     MSG msg = {};
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    bool running = true;
+    while (running) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                running = false;
+                break;
+            }
+            if (msg.message == WM_KEYDOWN && msg.wParam == VK_TAB) {
+                HWND cur = GetFocus();
+                for (int i = 0; i < (int)_countof(tabOrder); ++i) {
+                    if (cur == tabOrder[i]) {
+                        int step = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1;
+                        int next = (i + step + (int)_countof(tabOrder)) % (int)_countof(tabOrder);
+                        SetFocus(tabOrder[next]);
+                        cur = nullptr;
+                        break;
+                    }
+                }
+                if (cur == nullptr) continue;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        if (!running) break;
+
+        bool visibleAndActive = (IsWindow(hwndMain) && IsWindowVisible(hwndMain) && !IsIconic(hwndMain));
+        float dt = 0.0f;
+        if (g_app.m_framePacer.WaitOrCheckFrameReady(visibleAndActive, dt)) {
+            g_app.TickAndRenderUi(dt);
+        }
     }
 
     if (g_app.m_hKeyboardHook) UnhookWindowsHookEx(g_app.m_hKeyboardHook);
@@ -3265,5 +4947,5 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     MFShutdown();
     CoUninitialize();
     WSACleanup();
-    return 0;
+    return (int)msg.wParam;
 }
